@@ -231,7 +231,7 @@ class ParetoNBDModel(CLVModel):
         frequency: Union[np.ndarray, pd.Series, xarray.DataArray, None],
         recency: Union[np.ndarray, pd.Series, xarray.DataArray, None],
         T: Union[np.ndarray, pd.Series, xarray.DataArray, None],
-    ) -> Tuple[xarray.DataArray]:
+    ) -> Tuple[xarray.DataArray, ...]:
         """Utility function assigning default customer arguments
         for predictive methods and converting to xarrays.
         """
