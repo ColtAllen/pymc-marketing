@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Labs Developers
+#   Copyright 2025 The PyMC Labs Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -29,7 +29,6 @@ import xarray as xr
 from pymc.util import RandomState
 
 from pymc_marketing.hsgp_kwargs import HSGPKwargs
-from pymc_marketing.prior import Prior
 from pymc_marketing.utils import from_netcdf
 
 # If scikit-learn is available, use its data validator
@@ -353,8 +352,8 @@ class ModelBuilder(ABC):
         """
 
         def default(x):
-            if isinstance(x, Prior):
-                return x.to_json()
+            if hasattr(x, "to_dict"):
+                return x.to_dict()
             elif isinstance(x, HSGPKwargs):
                 return x.model_dump(mode="json")
             return x.__dict__
@@ -685,6 +684,42 @@ class ModelBuilder(ABC):
         self.set_idata_attrs(self.idata)
         return self.idata  # type: ignore
 
+    @property
+    def fit_result(self) -> xr.Dataset:
+        """Get the posterior fit_result.
+
+        Returns
+        -------
+        InferenceData object.
+
+        """
+        return create_idata_accessor(
+            "posterior", "The model hasn't been fit yet, call .fit() first"
+        ).__get__(self)
+
+    @fit_result.setter
+    def fit_result(self, res: az.InferenceData) -> None:
+        """Create a setter method to overwrite the pre-existing fit_result.
+
+        Parameters
+        ----------
+        res : az.InferenceData
+            The inferencedata object to be set
+
+        Returns
+        -------
+        property
+            The property setter for the InferenceData object.
+
+        """
+        if self.idata is None:
+            self.idata = res
+        elif "posterior" in self.idata:
+            warnings.warn("Overriding pre-existing fit_result", stacklevel=1)
+            self.idata.posterior = res
+        else:
+            self.idata.posterior = res
+
     def predict(
         self,
         X_pred: np.ndarray | pd.DataFrame | pd.Series,
@@ -951,16 +986,19 @@ class ModelBuilder(ABC):
 
     prior = create_idata_accessor(
         "prior",
-        "Call the 'sample_prior_predictive' method first.",
+        "The model hasn't been sampled yet, call .sample_prior_predictive() first",
     )
     prior_predictive = create_idata_accessor(
         "prior_predictive",
-        "Call the 'sample_prior_predictive' method first.",
+        "The model hasn't been sampled yet, call .sample_prior_predictive() first",
     )
-    posterior = create_idata_accessor("posterior", "Call the 'fit' method first.")
+    posterior = create_idata_accessor(
+        "posterior", "The model hasn't been fit yet, call .fit() first"
+    )
+
     posterior_predictive = create_idata_accessor(
         "posterior_predictive",
-        "Call the 'sample_posterior_predictive' method first.",
+        "The model hasn't been fit yet, call .sample_posterior_predictive() first",
     )
     predictions = create_idata_accessor(
         "predictions",

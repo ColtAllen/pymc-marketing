@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Labs Developers
+#   Copyright 2025 The PyMC Labs Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -321,7 +321,7 @@ class FourierBase(BaseModel):
 
         Parameters
         ----------
-        prior : Prior
+        prior : VariableFactory | Prior
             The prior distribution to serialize.
 
         Returns
@@ -330,10 +330,7 @@ class FourierBase(BaseModel):
             The serialized prior distribution.
 
         """
-        if hasattr(prior, "to_dict"):
-            return prior.to_dict()
-
-        return prior.to_json()
+        return prior.to_dict()
 
     @property
     def nodes(self) -> list[str]:

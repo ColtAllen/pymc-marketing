@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Labs Developers
+#   Copyright 2025 The PyMC Labs Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -243,7 +243,7 @@ def test_saturation_from_dict_without_priors(saturation) -> None:
 
     saturation = saturation_from_dict(data)
     assert saturation.default_priors == {
-        k: Prior.from_json(v) for k, v in saturation.to_dict()["priors"].items()
+        k: Prior.from_dict(v) for k, v in saturation.to_dict()["priors"].items()
     }
 
 

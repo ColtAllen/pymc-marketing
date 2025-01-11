@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Labs Developers
+#   Copyright 2025 The PyMC Labs Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -219,9 +219,9 @@ class MVITS(ModelBuilder):
     @property
     def _serializable_model_config(self) -> dict[str, int | float | dict]:  # type: ignore
         result: dict[str, int | float | dict] = {
-            "intercept": self.model_config["intercept"].to_json(),
-            "likelihood": self.model_config["likelihood"].to_json(),
-            "market_distribution": self.model_config["market_distribution"].to_json(),
+            "intercept": self.model_config["intercept"].to_dict(),
+            "likelihood": self.model_config["likelihood"].to_dict(),
+            "market_distribution": self.model_config["market_distribution"].to_dict(),
         }
 
         return result
