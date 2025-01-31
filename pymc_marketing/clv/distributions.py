@@ -888,3 +888,73 @@ class ModifiedBetaGeoNBD(PositiveContinuous):
             r > 0,
             msg="a > 0, b > 0, alpha > 0, r > 0",
         )
+
+
+class GrassiaIIGeometric(Discrete):
+    r"""Grassia(II)-geometric distribution for a discrete-time, contractual customer population.
+
+    Described by Hardie and Fader in [1]_, for incorporating time-varying covariates into a discrete time model.
+
+    This distribution is described by the following PMF and survival functions:
+
+    .. math::
+        \mathbb{P}T=t|r,\alpha,\beta;Z(t)) = (\frac{\alpha}{\alpha+C(t-1)})^{r} - (\frac{\alpha}{\alpha+C(t)})^{r}  \\
+        \begin{align}
+        \mathbb{S}(t|r,\alpha,\beta;Z(t)) = (\frac{\alpha}{\alpha+C(t)})^{r} \\
+        where \\
+        C(t) = \sum_{i=1}^{t} Z(i)
+        \end{align}
+    ========  ===============================================
+    Support   :math:`0 <= t <= T`
+    ========  ===============================================
+
+    Parameters
+    ----------
+    r : tensor_like of float
+        Shape parameter of Gamma distribution describing customer heterogeneity. (r > 0)
+    alpha : tensor_like of float
+        Scale parameter of Gamma distribution describing customer heterogeneity. (alpha > 0)
+    beta : tensor_like of float
+        Coefficient array for time-varying covariates.
+
+    References
+    ----------
+    .. [1] Fader, Peter & G. S. Hardie, Bruce (2020).
+       "Incorporating Time-Varying Covariates in a Simple Mixture Model for Discrete-Time Duration Data."
+       https://www.brucehardie.com/notes/037/time-varying_covariates_in_BG.pdf
+    """
+
+    rv_op = None
+
+    @classmethod
+    def dist(cls, r, alpha, beta, *args, **kwargs):
+        r = pt.as_tensor_variable(r)
+        alpha = pt.as_tensor_variable(alpha)
+        beta = pt.as_tensor_variable(beta)
+        return super().dist([r, alpha, beta], *args, **kwargs)
+
+    @staticmethod
+    def _log_C_t(value, beta):
+        C_t = pt.cumsum(beta)
+        return C_t
+
+    def logp(self, value, r, alpha, beta):
+        logp = r * (
+            pt.log(alpha) - pt.log(alpha) - _log_C_t(value - 1, beta)
+        ) - r * r * (pt.log(alpha) - pt.log(alpha) - _log_C_t(value, beta))
+        return check_parameters(
+            logp,
+            r > 0,
+            alpha > 0,
+            msg="s > 0, alpha > 0",
+        )
+
+    def logcdf(self, value, r, alpha, beta):
+        logcdf = -r * (pt.log(alpha) - pt.log(alpha) - _log_C_t(value, beta))
+
+        return check_parameters(
+            logcdf,
+            r > 0,
+            alpha > 0,
+            msg="s > 0, alpha > 0",
+        )
