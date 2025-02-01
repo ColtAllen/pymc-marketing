@@ -913,7 +913,8 @@ class GrassiaIIGeometricRV(RandomVariable):
 
         output = np.zeros(shape=size + (2,))  # noqa:RUF005
 
-        lam = rng.gamma(shape=r, scale=1 / alpha, size=size)  # scale=1/alpha?
+        # TODO: Verify this implementation
+        lam = rng.gamma(shape=alpha, scale=r, size=size)
 
         def sim_data(lam):
             # TODO: Which of these is the correct implementation?
