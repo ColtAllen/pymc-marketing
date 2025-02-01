@@ -900,6 +900,35 @@ class GrassiaIIGeometricRV(RandomVariable):
     def __call__(self, r, alpha, size=None, **kwargs):
         return super().__call__(r, alpha, size=size, **kwargs)
 
+    @classmethod
+    def rng_fn(cls, rng, r, alpha, size):
+        if size is None:
+            size = np.broadcast_shapes(r.shape, alpha.shape)
+
+        r = np.asarray(r)
+        alpha = np.asarray(alpha)
+
+        r = np.broadcast_to(r, size)
+        alpha = np.broadcast_to(alpha, size)
+
+        output = np.zeros(shape=size + (2,))  # noqa:RUF005
+
+        lam = rng.gamma(shape=r, scale=1 / alpha, size=size)  # scale=1/alpha?
+
+        def sim_data(lam):
+            # TODO: Which of these is the correct implementation?
+            p = 1 - np.exp(-lam)
+            # p = np.exp(-lam * (t - 1)) - np.exp(-lam * t)
+
+            t = rng.geometric(p)
+
+            return np.array([t])
+
+        for index in np.ndindex(*size):
+            output[index] = sim_data(lam[index])
+
+        return output
+
 
 g2g = GrassiaIIGeometricRV()
 
@@ -940,8 +969,8 @@ class GrassiaIIGeometric(UnitContinuous):
         alpha = pt.as_tensor_variable(alpha)
         return super().dist([r, alpha], *args, **kwargs)
 
-    def logp(self, value, r, alpha):
-        logp = -r * (pt.log(alpha - value - 1) - pt.log(alpha - value))
+    def logp(value, r, alpha):
+        logp = -r * (pt.log(alpha + value - 1) - pt.log(alpha + value))
 
         return check_parameters(
             logp,
@@ -950,7 +979,7 @@ class GrassiaIIGeometric(UnitContinuous):
             msg="s > 0, alpha > 0",
         )
 
-    def logcdf(self, value, r, alpha):
+    def logcdf(value, r, alpha):
         logcdf = -r * (pt.log(alpha) - pt.log(alpha - value))
 
         return check_parameters(
