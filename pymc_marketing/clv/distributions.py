@@ -17,7 +17,7 @@ from functools import reduce
 
 import numpy as np
 import pytensor.tensor as pt
-from pymc.distributions.continuous import PositiveContinuous
+from pymc.distributions.continuous import PositiveContinuous, UnitContinuous
 from pymc.distributions.dist_math import betaln, check_parameters
 from pymc.distributions.distribution import Discrete
 from pytensor import scan
@@ -890,7 +890,21 @@ class ModifiedBetaGeoNBD(PositiveContinuous):
         )
 
 
-class GrassiaIIGeometric(Discrete):
+class GrassiaIIGeometricRV(RandomVariable):
+    name = "g2g"
+    signature = "(),()->(1)"
+
+    dtype = "floatX"
+    _print_name = ("GrassiaIIGeometric", "\\operatorname{GrassiaIIGeometric}")
+
+    def __call__(self, r, alpha, size=None, **kwargs):
+        return super().__call__(r, alpha, size=size, **kwargs)
+
+
+g2g = GrassiaIIGeometricRV()
+
+
+class GrassiaIIGeometric(UnitContinuous):
     r"""Grassia(II)-Geometric distribution for a discrete-time, contractual customer population.
 
     Described by Hardie and Fader in [1]_, this distribution is comprised by the following PMF and survival functions:
@@ -918,7 +932,7 @@ class GrassiaIIGeometric(Discrete):
        https://www.brucehardie.com/notes/037/time-varying_covariates_in_BG.pdf
     """
 
-    rv_op = None
+    rv_op = g2g
 
     @classmethod
     def dist(cls, r, alpha, *args, **kwargs):
