@@ -891,21 +891,17 @@ class ModifiedBetaGeoNBD(PositiveContinuous):
 
 
 class GrassiaIIGeometric(Discrete):
-    r"""Grassia(II)-geometric distribution for a discrete-time, contractual customer population.
+    r"""Grassia(II)-Geometric distribution for a discrete-time, contractual customer population.
 
-    Described by Hardie and Fader in [1]_, for incorporating time-varying covariates into a discrete time model.
-
-    This distribution is described by the following PMF and survival functions:
+    Described by Hardie and Fader in [1]_, this distribution is comprised by the following PMF and survival functions:
 
     .. math::
         \mathbb{P}T=t|r,\alpha,\beta;Z(t)) = (\frac{\alpha}{\alpha+C(t-1)})^{r} - (\frac{\alpha}{\alpha+C(t)})^{r}  \\
         \begin{align}
         \mathbb{S}(t|r,\alpha,\beta;Z(t)) = (\frac{\alpha}{\alpha+C(t)})^{r} \\
-        where \\
-        C(t) = \sum_{i=1}^{t} Z(i)
         \end{align}
     ========  ===============================================
-    Support   :math:`0 <= t <= T`
+    Support   :math:`0 < t <= T` for :math: `t = 1, 2, \dots, T`
     ========  ===============================================
 
     Parameters
@@ -914,8 +910,6 @@ class GrassiaIIGeometric(Discrete):
         Shape parameter of Gamma distribution describing customer heterogeneity. (r > 0)
     alpha : tensor_like of float
         Scale parameter of Gamma distribution describing customer heterogeneity. (alpha > 0)
-    beta : tensor_like of float
-        Coefficient array for time-varying covariates.
 
     References
     ----------
@@ -927,21 +921,14 @@ class GrassiaIIGeometric(Discrete):
     rv_op = None
 
     @classmethod
-    def dist(cls, r, alpha, beta, *args, **kwargs):
+    def dist(cls, r, alpha, *args, **kwargs):
         r = pt.as_tensor_variable(r)
         alpha = pt.as_tensor_variable(alpha)
-        beta = pt.as_tensor_variable(beta)
-        return super().dist([r, alpha, beta], *args, **kwargs)
+        return super().dist([r, alpha], *args, **kwargs)
 
-    @staticmethod
-    def _log_C_t(value, beta):
-        C_t = pt.cumsum(beta)
-        return C_t
+    def logp(self, value, r, alpha):
+        logp = -r * (pt.log(alpha - value - 1) - pt.log(alpha - value))
 
-    def logp(self, value, r, alpha, beta):
-        logp = r * (
-            pt.log(alpha) - pt.log(alpha) - _log_C_t(value - 1, beta)
-        ) - r * r * (pt.log(alpha) - pt.log(alpha) - _log_C_t(value, beta))
         return check_parameters(
             logp,
             r > 0,
@@ -949,8 +936,8 @@ class GrassiaIIGeometric(Discrete):
             msg="s > 0, alpha > 0",
         )
 
-    def logcdf(self, value, r, alpha, beta):
-        logcdf = -r * (pt.log(alpha) - pt.log(alpha) - _log_C_t(value, beta))
+    def logcdf(self, value, r, alpha):
+        logcdf = -r * (pt.log(alpha) - pt.log(alpha - value))
 
         return check_parameters(
             logcdf,
