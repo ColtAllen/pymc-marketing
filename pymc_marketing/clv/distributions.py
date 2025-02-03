@@ -892,14 +892,16 @@ class ModifiedBetaGeoNBD(PositiveContinuous):
 
 class GrassiaIIGeometricRV(RandomVariable):
     name = "g2g"
-    signature = "(),()->(1)"
+    signature = "(),()->()"
 
-    dtype = "floatX"
+    dtype = "int64"
     _print_name = ("GrassiaIIGeometric", "\\operatorname{GrassiaIIGeometric}")
 
     def __call__(self, r, alpha, size=None, **kwargs):
         return super().__call__(r, alpha, size=size, **kwargs)
 
+    # TODO: Work off of the pytensor Geometric RV Op. This will either be imported, or modified
+    #       https://github.com/pymc-devs/pytensor/blob/main/pytensor/tensor/random/basic.py#L1041
     @classmethod
     def rng_fn(cls, rng, r, alpha, size):
         if size is None:
@@ -917,8 +919,9 @@ class GrassiaIIGeometricRV(RandomVariable):
         lam = rng.gamma(shape=alpha, scale=r, size=size)
 
         def sim_data(lam):
-            # TODO: Which of these is the correct implementation?
+            # TODO: This implementation could in theory be used with the existing pytensor Geometric RV op.
             p = 1 - np.exp(-lam)
+            # TODO: This is the closed-form solution and requires a custom pytensor op.
             # p = np.exp(-lam * (t - 1)) - np.exp(-lam * t)
 
             t = rng.geometric(p)
@@ -989,3 +992,5 @@ class GrassiaIIGeometric(UnitContinuous):
             alpha > 0,
             msg="s > 0, alpha > 0",
         )
+
+    # TODO: Add sf? logsf?
