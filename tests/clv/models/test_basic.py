@@ -124,11 +124,38 @@ class TestCLVModel:
         assert len(idata.posterior.draw) == 10
         assert model.fit_result is idata.posterior
 
+    def test_fit_advi(self, mocker):
+        model = CLVModelTest()
+        # mocker.patch("pymc.sample", mock_sample)
+        idata = model.fit(
+            fit_method="advi",
+            tune=5,
+            chains=2,
+            draws=10,
+        )
+        assert isinstance(idata, InferenceData)
+        assert len(idata.posterior.chain) == 1
+        assert len(idata.posterior.draw) == 10
+
+    def test_fit_advi_with_wrong_chains_advi_kwargs(self, mocker):
+        model = CLVModelTest()
+
+        with pytest.warns(
+            UserWarning,
+            match="The 'chains' parameter must be 1 with 'advi'. Sampling only 1 chain despite the provided parameter.",
+        ):
+            model.fit(
+                fit_method="advi",
+                tune=5,
+                chains=2,
+                draws=10,
+            )
+
     def test_wrong_fit_method(self):
         model = CLVModelTest()
         with pytest.raises(
             ValueError,
-            match=r"Fit method options are \['mcmc', 'map', 'demz'\], got: wrong_method",
+            match=r"Fit method options are \['mcmc', 'map', 'demz', 'advi', 'fullrank_advi'\], got: wrong_method",
         ):
             model.fit(fit_method="wrong_method")
 
@@ -207,3 +234,32 @@ class TestCLVModel:
         assert model.model_config == {
             "x": Prior("StudentT", mu=0, sigma=5, nu=15),
         }
+
+    def test_backwards_compatibility_with_old_config(self):
+        model = CLVModelTest()
+        model.build_model()
+
+        old_posterior = from_dict(posterior={"alpha_prior": np.random.randn(2, 100)})
+        set_model_fit(model, old_posterior)
+        assert "alpha_prior" in model.idata.posterior
+
+        save_path = "test_model"
+        model.save(save_path)
+
+        loaded_model = CLVModelTest.load(save_path)
+
+        assert "alpha" in loaded_model.idata.posterior
+        assert "alpha_prior" not in loaded_model.idata.posterior
+
+        os.remove("test_model")
+
+    def test_deprecation_warning_on_old_config(self):
+        old_model_config = {
+            "x_prior": {"dist": "Normal", "kwargs": {"mu": 0, "sigma": 1}}
+        }
+        with pytest.warns(
+            DeprecationWarning, match="The key 'x_prior' in model_config is deprecated"
+        ):
+            model = CLVModelTest(model_config=old_model_config)
+
+        assert model.model_config == {"x": Prior("Normal", mu=0, sigma=1)}

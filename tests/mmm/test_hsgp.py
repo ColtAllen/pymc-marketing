@@ -13,6 +13,8 @@
 #   limitations under the License.
 import matplotlib.pyplot as plt
 import numpy as np
+import pymc as pm
+import pytensor
 import pytensor.tensor as pt
 import pytest
 import xarray as xr
@@ -25,6 +27,7 @@ from pymc_marketing.mmm.hsgp import (
     CovFunc,
     HSGPPeriodic,
     PeriodicCovFunc,
+    SoftPlusHSGP,
     approx_hsgp_hyperparams,
     create_complexity_penalizing_prior,
 )
@@ -307,3 +310,93 @@ def test_from_dict_with_non_dictionary_distribution_hspg_periodic() -> None:
     assert hsgp.scale == 1
     assert hsgp.X_mid is None
     assert hsgp.dims == ("time",)
+
+
+def test_hsgp_with_shared_data():
+    """
+    Test that HSGP works with a shared variable (pm.MutableData / pm.Data) and that
+    the computed graph properly includes and depends on the shared data.
+    """
+    n_points = 10
+    X = np.arange(n_points, dtype=float)
+    coords = {"time": X}
+
+    # Create a model and a shared data variable using pm.MutableData
+    with pm.Model(coords=coords) as model:
+        # Create a shared data variable with the name "X_shared"
+        X_shared = pm.Data("X_shared", X, dims="time")
+        # Parameterize the HSGP using the shared data
+        hsgp = HSGP.parameterize_from_data(X_shared, dims="time")
+        # Create the deterministic variable "f" from the HSGP configuration
+        f = hsgp.create_variable("f")
+
+        # Check that "f" is added to the model variables
+        assert "f" in model.named_vars
+
+        # Ensure that the stored X is a shared tensor variable
+        assert isinstance(hsgp.X, pt.TensorVariable)
+
+        # Verify that f depends on X_shared in the computational graph
+        assert any(
+            var.name == "X_shared"
+            for var in pytensor.graph.basic.ancestors([f])
+            if hasattr(var, "name")
+        ), "f is not connected to X_shared in the computational graph"
+
+        # Sample from prior to get initial values
+        prior = pm.sample_prior_predictive(draws=1)
+
+        # prior should have a "f" variable
+        assert "f" in prior.prior
+
+
+def test_soft_plus_hsgp_continous_with_new_data() -> None:
+    seed = sum(map(ord, "No jump from in-sample to out-of-sample"))
+    rng = np.random.default_rng(seed)
+    hsgp = SoftPlusHSGP(
+        m=10,
+        L=5,
+        dims="date",
+        ls=Prior("Exponential", lam=1),
+        eta=Prior("Exponential", lam=1),
+    )
+
+    n_points = 100
+    data = np.linspace(0, 10, n_points)
+
+    n_out_of_sample = 1
+    insample = data[: n_points - n_out_of_sample]
+    outsample = data[n_points - n_out_of_sample :]
+
+    prior_samples = 50
+
+    coords = {"date": insample}
+    with pm.Model(coords=coords) as model:
+        X = pm.Data("X", insample, dims="date")
+        hsgp.register_data(X).create_variable("f")
+
+        idata = pm.sample_prior_predictive(prior_samples, random_seed=rng)
+
+    # set posterior as prior for out of sample
+    idata["posterior"] = idata.prior
+
+    with model:
+        pm.set_data({"X": outsample}, coords={"date": outsample})
+
+        idata.extend(
+            pm.sample_posterior_predictive(
+                idata,
+                var_names=["f"],
+                random_seed=rng,
+            )
+        )
+
+    jump = idata.posterior_predictive["f"].isel(date=0) - idata.prior["f"].isel(date=-1)
+    diffs = idata.prior["f"].diff(dim="date")
+
+    q = 0.95
+    threshold = abs(diffs).quantile(q, dim="date")
+    stat = abs(jump) < threshold
+
+    # Approx 95% of the differences should be below the threshold
+    assert stat.mean().item() >= (q - 0.05)
