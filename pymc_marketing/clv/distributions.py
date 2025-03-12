@@ -918,10 +918,8 @@ class GrassiaIIGeometricRV(RandomVariable):
         lam = rng.gamma(shape=r, scale=1 / alpha, size=size)
 
         def sim_data(lam):
-            # TODO: Why isn't this preventing division by zero?
-            eps = 1e-5
-            # TODO: To support time-varying covariates, covariate vector must be added here
-            p = 1 - np.exp(-lam) + eps
+            # TODO: To support time-varying covariates, covariate vector may need to be added
+            p = 1 - np.exp(-lam)
 
             t = rng.geometric(p)
 
@@ -983,8 +981,8 @@ class GrassiaIIGeometric(UnitContinuous):
         )
 
     def logcdf(value, r, alpha):
-        # TODO: Math may not be correct here. log(1 - SF) != log(1) - log(
-        logcdf = -r * (pt.log(alpha) - pt.log(alpha + value))
+        # TODO: Math may not be correct here
+        logcdf = r * (pt.log(value) - pt.log(alpha + value))
 
         return check_parameters(
             logcdf,
