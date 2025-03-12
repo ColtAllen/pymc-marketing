@@ -915,11 +915,10 @@ class GrassiaIIGeometricRV(RandomVariable):
 
         output = np.zeros(shape=size + (1,))  # noqa:RUF005
 
-        # r and alpha params seem to be swapped in the original paper
-        lam = rng.gamma(shape=alpha, scale=r, size=size)
+        lam = rng.gamma(shape=r, scale=1 / alpha, size=size)
 
         def sim_data(lam):
-            # prevent division by zero
+            # TODO: Why isn't this preventing division by zero?
             eps = 1e-5
             # TODO: To support time-varying covariates, covariate vector must be added here
             p = 1 - np.exp(-lam) + eps
@@ -974,7 +973,7 @@ class GrassiaIIGeometric(UnitContinuous):
         return super().dist([r, alpha], *args, **kwargs)
 
     def logp(value, r, alpha):
-        logp = -r * (pt.log(alpha + value - 1) - pt.log(alpha + value))
+        logp = -r * (pt.log(alpha + value - 1) + pt.log(alpha + value))
 
         return check_parameters(
             logp,
@@ -984,7 +983,8 @@ class GrassiaIIGeometric(UnitContinuous):
         )
 
     def logcdf(value, r, alpha):
-        logcdf = -r * (pt.log(alpha) - pt.log(alpha - value))
+        # TODO: Math may not be correct here. log(1 - SF) != log(1) - log(
+        logcdf = -r * (pt.log(alpha) - pt.log(alpha + value))
 
         return check_parameters(
             logcdf,
