@@ -5,6 +5,7 @@ channels:
   - defaults
 dependencies:
 # Base dependencies
+- python>=3.10
 - arviz>=0.13.0
 - matplotlib>=3.5.1
 - numpy>=1.17
@@ -12,17 +13,17 @@ dependencies:
 - pandas
 - streamlit>=1.25.0
 - pip
-- pydantic
-- preliz
+- pydantic>=2.1.0
+- preliz>=0.8.0
 - pyprojroot
 # NOTE: Keep minimum pymc version in sync with ci.yml `OLDEST_PYMC_VERSION`
-- pymc>=5.22.0
-- pytensor>=2.30.3
+- pymc>=5.23.0
+- pytensor>=2.31.3
 - pymc-extras>=0.2.1
 - blackjax>=1.2.4
 - scikit-learn>=1.1.1
 - seaborn>=0.12.2
-- xarray
+- xarray>=2024.1.0
 - xarray-einstats>=0.5.1
 # Extra dependencies for lint, testing and docs build
 # docs
