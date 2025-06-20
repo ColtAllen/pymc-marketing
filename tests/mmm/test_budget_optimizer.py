@@ -59,11 +59,36 @@ def dummy_df():
 
 
 @pytest.mark.parametrize(
-    argnames="total_budget, budget_bounds, parameters, minimize_kwargs, expected_optimal, expected_response",
+    argnames="total_budget, budget_bounds, x0, parameters, minimize_kwargs, expected_optimal, expected_response",
     argvalues=[
         (
             100,
             None,
+            None,
+            {
+                "saturation_params": {
+                    "lam": np.array(
+                        [[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.6], [0.7, 0.8]]]
+                    ),  # dims: chain, draw, channel
+                    "beta": np.array(
+                        [[[0.5, 1.0], [0.5, 1.0]], [[0.5, 1.0], [0.5, 1.0]]]
+                    ),  # dims: chain, draw, channel
+                },
+                "adstock_params": {
+                    "alpha": np.array(
+                        [[[0.5, 0.7], [0.5, 0.7]], [[0.5, 0.7], [0.5, 0.7]]]
+                    )  # dims: chain, draw, channel
+                },
+            },
+            None,
+            {"channel_1": 54.78357587906867, "channel_2": 45.21642412093133},
+            48.8,
+        ),
+        # set x0 manually
+        (
+            100,
+            None,
+            np.array([50, 50]),
             {
                 "saturation_params": {
                     "lam": np.array(
@@ -91,6 +116,7 @@ def dummy_df():
                 channel=["channel_1", "channel_2"],
                 bound=["lower", "upper"],
             ),
+            None,
             {
                 "saturation_params": {
                     "lam": np.array(
@@ -121,6 +147,7 @@ def dummy_df():
                 channel=["channel_1", "channel_2"],
                 bound=["lower", "upper"],
             ),
+            None,
             {
                 "saturation_params": {
                     "lam": np.array(
@@ -142,11 +169,17 @@ def dummy_df():
             2.38e-10,
         ),
     ],
-    ids=["default_minimizer_kwargs", "custom_minimizer_kwargs", "zero_total_budget"],
+    ids=[
+        "default_minimizer_kwargs",
+        "manually_set_x0",
+        "custom_minimizer_kwargs",
+        "zero_total_budget",
+    ],
 )
 def test_allocate_budget(
     total_budget,
     budget_bounds,
+    x0,
     parameters,
     minimize_kwargs,
     expected_optimal,
@@ -184,6 +217,7 @@ def test_allocate_budget(
     optimal_budgets, optimization_res = optimizer.allocate_budget(
         total_budget=total_budget,
         budget_bounds=budget_bounds,
+        x0=x0,
         minimize_kwargs=minimize_kwargs,
     )
 
@@ -302,7 +336,7 @@ def test_allocate_budget_infeasible_constraints(
     # Instantiate BudgetOptimizer with custom constraints
     optimizer = BudgetOptimizer(
         model=mmm,
-        response_variable="total_contributions",
+        response_variable="total_contribution",
         default_constraints=False,  # Avoid default equality constraints
         custom_constraints=custom_constraints,
         num_periods=30,
@@ -320,7 +354,7 @@ def mean_response_eq_constraint_fun(
     Enforces mean_response(budgets_sym) = target_response,
     i.e. returns (mean_resp - target_response).
     """
-    resp_dist = optimizer.extract_response_distribution("total_contributions")
+    resp_dist = optimizer.extract_response_distribution("total_contribution")
     mean_resp = pt.mean(_check_samples_dimensionality(resp_dist))
     return mean_resp - target_response
 
@@ -383,7 +417,7 @@ def test_allocate_budget_custom_response_constraint(
 
     optimizer = BudgetOptimizer(
         model=mmm,
-        response_variable="total_contributions",
+        response_variable="total_contribution",
         utility_function=minimize_budget_utility,
         default_constraints=False,
         custom_constraints=custom_constraints,
@@ -395,7 +429,7 @@ def test_allocate_budget_custom_response_constraint(
         budget_bounds=None,
     )
 
-    resp_dist_sym = optimizer.extract_response_distribution("total_contributions")
+    resp_dist_sym = optimizer.extract_response_distribution("total_contribution")
     resp_mean_sym = pt.mean(_check_samples_dimensionality(resp_dist_sym))
     test_fn = pytensor.function([optimizer._budgets_flat], resp_mean_sym)
     final_resp = test_fn(res.x)

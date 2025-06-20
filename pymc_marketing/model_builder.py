@@ -148,7 +148,7 @@ class DifferentModelError(Exception):
 
 
 class ModelBuilder(ABC):
-    """Base class for building models with PyMC Marketing.
+    """Base class for building models with PyMC-Marketing.
 
     It provides an easy-to-use API (similar to scikit-learn) for models
     and help with deployment.
@@ -567,7 +567,17 @@ class ModelBuilder(ABC):
         model.build_from_idata(idata)
         model.post_sample_model_transformation()
 
-        if model.id != idata.attrs["id"]:
+        if (model_version := model.version) != (
+            loaded_version := idata.attrs["version"]
+        ):
+            msg = (
+                f"The model version ({loaded_version}) in the InferenceData does not "
+                f"match the model version ({model_version}). "
+                "There was no error loading the inference data, but the model structure "
+                "is different. "
+            )
+            raise DifferentModelError(msg)
+        elif model.id != idata.attrs["id"]:
             msg = (
                 "The model id in the InferenceData does not match the model id. "
                 "There was no error loading the inference data, but the model may "

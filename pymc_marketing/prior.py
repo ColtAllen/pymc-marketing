@@ -97,7 +97,6 @@ Create a prior with a custom transform function by registering it with
 from __future__ import annotations
 
 import copy
-import warnings
 from collections.abc import Callable
 from inspect import signature
 from typing import Any, Protocol, runtime_checkable
@@ -466,6 +465,8 @@ class Prior:
     def dims(self, dims) -> None:
         if isinstance(dims, str):
             dims = (dims,)
+        elif isinstance(dims, list):
+            dims = tuple(dims)
 
         self._dims = dims or ()
 
@@ -800,24 +801,6 @@ class Prior:
 
         return data
 
-    def to_json(self) -> dict[str, Any]:
-        """Convert the prior to dictionary format.
-
-        Deprecated in favor of :function:`pymc_marketing.prior.Prior.to_dict`.
-
-        Returns
-        -------
-        dict[str, Any]
-            The dictionary format of the prior.
-
-        """
-        warnings.warn(
-            "The `to_json` method is deprecated in favor of `to_dict`",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.to_dict()
-
     @classmethod
     def from_dict(cls, data) -> Prior:
         """Create a Prior from the dictionary format.
@@ -877,30 +860,6 @@ class Prior:
         transform = data.get("transform")
 
         return cls(dist, dims=dims, centered=centered, transform=transform, **kwargs)
-
-    @classmethod
-    def from_json(cls, json) -> Prior:
-        """Create a Prior from the dictionary format.
-
-        Deprecated in favor of :function:`pymc_marketing.prior.Prior.from_dict`.
-
-        Parameters
-        ----------
-        json : dict[str, Any]
-            The dictionary format of the prior.
-
-        Returns
-        -------
-        Prior
-            The prior distribution.
-
-        """
-        warnings.warn(
-            "The `from_json` method is deprecated in favor of `from_dict`",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return cls.from_dict(json)
 
     def constrain(
         self, lower: float, upper: float, mass: float = 0.95, kwargs=None
@@ -1150,6 +1109,59 @@ class Prior:
         return distribution.create_variable(name)
 
 
+def is_alternative_prior(data: Any) -> bool:
+    """Check if the data is a dictionary representing a Prior (alternative check)."""
+    return isinstance(data, dict) and "distribution" in data
+
+
+def deserialize_alternative_prior(data: dict[str, Any]) -> Prior:
+    """Alternative deserializer that recursively handles all nested parameters.
+
+    This implementation is more general and handles cases where any parameter
+    might be a nested prior, and also extracts centered and transform parameters.
+
+    Examples
+    --------
+    This handles cases like:
+
+    .. code-block:: yaml
+
+        distribution: Gamma
+        alpha: 1
+        beta:
+            distribution: HalfNormal
+            sigma: 1
+            dims: channel
+        dims: [brand, channel]
+
+    """
+    data = copy.deepcopy(data)
+
+    distribution = data.pop("distribution")
+    dims = data.pop("dims", None)
+    centered = data.pop("centered", True)
+    transform = data.pop("transform", None)
+    parameters = data
+
+    # Recursively deserialize any nested parameters
+    parameters = {
+        key: value if not isinstance(value, dict) else deserialize(value)
+        for key, value in parameters.items()
+    }
+
+    return Prior(
+        distribution,
+        transform=transform,
+        centered=centered,
+        dims=dims,
+        **parameters,
+    )
+
+
+# Register the alternative prior deserializer for more complex nested cases
+register_deserialization(is_alternative_prior, deserialize_alternative_prior)
+
+
 class VariableNotFound(Exception):
     """Variable is not found."""
 
@@ -1268,7 +1280,7 @@ class Censored:
         """Create a censored distribution from a dictionary."""
         data = data["data"]
         return cls(  # type: ignore
-            distribution=Prior.from_dict(data["dist"]),
+            distribution=deserialize(data["dist"]),
             lower=data["lower"],
             upper=data["upper"],
         )
@@ -1418,3 +1430,32 @@ def _is_censored_type(data: dict) -> bool:
 
 register_deserialization(is_type=_is_prior_type, deserialize=Prior.from_dict)
 register_deserialization(is_type=_is_censored_type, deserialize=Censored.from_dict)
+
+
+class Scaled:
+    """Scaled distribution for numerical stability."""
+
+    def __init__(self, dist: Prior, factor: float | pt.TensorVariable) -> None:
+        self.dist = dist
+        self.factor = factor
+
+    @property
+    def dims(self) -> Dims:
+        """The dimensions of the scaled distribution."""
+        return self.dist.dims
+
+    def create_variable(self, name: str) -> pt.TensorVariable:
+        """Create a scaled variable.
+
+        Parameters
+        ----------
+        name : str
+            The name of the variable.
+
+        Returns
+        -------
+        pt.TensorVariable
+            The scaled variable.
+        """
+        var = self.dist.create_variable(f"{name}_unscaled")
+        return pm.Deterministic(name, var * self.factor, dims=self.dims)
