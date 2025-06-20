@@ -125,17 +125,6 @@ class MMMPlotSuite:
 
         return data
 
-    def _compute_ci(
-        self, data: xr.DataArray, ci: float = 0.85, sample_dim: str = "sample"
-    ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
-        """Compute median and lower/upper credible intervals over given sample_dim."""
-        lower_q = 0.5 - ci / 2
-        upper_q = 0.5 + ci / 2
-        data_median = data.quantile(0.5, dim=sample_dim)
-        data_lower = data.quantile(lower_q, dim=sample_dim)
-        data_upper = data.quantile(upper_q, dim=sample_dim)
-        return data_median, data_lower, data_upper
-
     def _get_posterior_predictive_data(
         self,
         idata: xr.Dataset | None,
@@ -156,6 +145,25 @@ class MMMPlotSuite:
             )
         return self.idata.posterior_predictive  # type: ignore
 
+    def _add_median_and_hdi(
+        self, ax: Axes, data: xr.DataArray, var: str, hdi_prob: float = 0.85
+    ) -> Axes:
+        """Add median and HDI to the given axis."""
+        median = data.median(dim="sample") if "sample" in data.dims else data.median()
+        hdi = az.hdi(
+            data,
+            hdi_prob=hdi_prob,
+            input_core_dims=[["sample"]] if "sample" in data.dims else None,
+        )
+
+        if "date" not in data.dims:
+            raise ValueError(f"Expected 'date' dimension in {var}, but none found.")
+        dates = data.coords["date"].values
+        # Add median and HDI to the plot
+        ax.plot(dates, median, label=var, alpha=0.9)
+        ax.fill_between(dates, hdi[var][..., 0], hdi[var][..., 1], alpha=0.2)
+        return ax
+
     # ------------------------------------------------------------------------
     #                          Main Plotting Methods
     # ------------------------------------------------------------------------
@@ -164,6 +172,7 @@ class MMMPlotSuite:
         self,
         var: list[str] | None = None,
         idata: xr.Dataset | None = None,
+        hdi_prob: float = 0.85,
     ) -> tuple[Figure, NDArray[Axes]]:
         """Plot time series from the posterior predictive distribution.
 
@@ -177,6 +186,8 @@ class MMMPlotSuite:
         idata : xarray.Dataset, optional
             The posterior predictive dataset to plot. If not provided, tries to
             use `self.idata.posterior_predictive`.
+        hdi_prob: float, optional
+            The probability mass of the highest density interval to be displayed. Default is 0.85.
 
         Returns
         -------
@@ -190,7 +201,10 @@ class MMMPlotSuite:
         ValueError
             If no `idata` is provided and `self.idata.posterior_predictive` does
             not exist, instructing the user to run `MMM.sample_posterior_predictive()`.
+            If `hdi_prob` is not between 0 and 1, instructing the user to provide a valid value.
         """
+        if not 0 < hdi_prob < 1:
+            raise ValueError("HDI probability must be between 0 and 1.")
         # 1. Retrieve or validate posterior_predictive data
         pp_data = self._get_posterior_predictive_data(idata)
 
@@ -229,19 +243,7 @@ class MMMPlotSuite:
                 data = pp_data[v].sel(**indexers)
                 # Sum leftover dims, stack chain+draw if needed
                 data = self._reduce_and_stack(data, ignored_dims)
-                # Compute median & 85% intervals
-                median, lower, upper = self._compute_ci(data, ci=0.85)
-
-                # Extract date coordinate
-                if "date" not in data.dims:
-                    raise ValueError(
-                        f"Expected 'date' dimension in {v}, but none found."
-                    )
-                dates = data.coords["date"].values
-
-                # Plot
-                ax.plot(dates, median, label=v, alpha=0.9)
-                ax.fill_between(dates, lower, upper, alpha=0.2)
+                ax = self._add_median_and_hdi(ax, data, v, hdi_prob=hdi_prob)
 
             # 7. Subplot title & labels
             title = self._build_subplot_title(
@@ -259,7 +261,7 @@ class MMMPlotSuite:
     def contributions_over_time(
         self,
         var: list[str],
-        ci: float = 0.85,
+        hdi_prob: float = 0.85,
     ) -> tuple[Figure, NDArray[Axes]]:
         """Plot the time-series contributions for each variable in `var`.
 
@@ -271,9 +273,8 @@ class MMMPlotSuite:
         ----------
         var : list of str
             A list of variable names to plot from the posterior.
-        ci : float, optional
-            Credible interval width. For instance, 0.85 will show the
-            7.5th to 92.5th percentile range. The default is 0.85.
+        hdi_prob: float, optional
+            The probability mass of the highest density interval to be displayed. Default is 0.85.
 
         Returns
         -------
@@ -281,9 +282,14 @@ class MMMPlotSuite:
             The Figure object containing the subplots.
         axes : np.ndarray of matplotlib.axes.Axes
             Array of Axes objects corresponding to each subplot row.
+
+        Raises
+        ------
+        ValueError
+            If `hdi_prob` is not between 0 and 1, instructing the user to provide a valid value.
         """
-        if not 0 < ci < 1:
-            raise ValueError("Credible interval must be between 0 and 1.")
+        if not 0 < hdi_prob < 1:
+            raise ValueError("HDI probability must be between 0 and 1.")
 
         if not hasattr(self.idata, "posterior"):
             raise ValueError(
@@ -295,6 +301,11 @@ class MMMPlotSuite:
         all_dims = list(self.idata.posterior[main_var].dims)  # type: ignore
         ignored_dims = {"chain", "draw", "date"}
         additional_dims = [d for d in all_dims if d not in ignored_dims]
+
+        coords = {
+            key: value.to_numpy()
+            for key, value in self.idata.posterior[var].coords.items()
+        }
 
         # Identify combos
         if additional_dims:
@@ -318,20 +329,18 @@ class MMMPlotSuite:
                 else {}
             )
 
-            # Plot each var
+            # Plot posterior median and HDI for each var
             for v in var:
-                data = self.idata.posterior[v].sel(**indexers)  # type: ignore
+                data = self.idata.posterior[v]
+                missing_coords = {
+                    key: value for key, value in coords.items() if key not in data.dims
+                }
+                data = data.expand_dims(**missing_coords)
+                data = data.sel(**indexers)  # type: ignore
                 data = self._reduce_and_stack(
                     data, dims_to_ignore={"date", "chain", "draw", "sample"}
                 )
-
-                # Compute median and credible intervals
-                median, lower, upper = self._compute_ci(data, ci=ci)
-
-                # Extract dates
-                dates = data.coords["date"].values
-                ax.plot(dates, median, label=f"{v}", alpha=0.9)
-                ax.fill_between(dates, lower, upper, alpha=0.2)
+                ax = self._add_median_and_hdi(ax, data, v, hdi_prob=hdi_prob)
 
             title = self._build_subplot_title(
                 dims=additional_dims, combo=combo, fallback_title="Time Series"
@@ -454,7 +463,7 @@ class MMMPlotSuite:
         ----------
         samples : xr.Dataset
             The dataset containing the channel contributions and allocation values.
-            Expected to have 'channel_contributions' and 'allocation' variables.
+            Expected to have 'channel_contribution' and 'allocation' variables.
         scale_factor : float, optional
             Scale factor to convert to original scale, if original_scale=True.
             If None and original_scale=True, assumes scale_factor=1.
@@ -522,17 +531,17 @@ class MMMPlotSuite:
             reduction_dims = [
                 dim for dim in samples[channel_contrib_var].dims if dim != "channel"
             ]
-            channel_contributions = (
+            channel_contribution = (
                 samples[channel_contrib_var].mean(dim=reduction_dims).to_numpy()
             )
 
-            # Ensure channel_contributions is 1D
-            if channel_contributions.ndim > 1:
-                channel_contributions = channel_contributions.flatten()
+            # Ensure channel_contribution is 1D
+            if channel_contribution.ndim > 1:
+                channel_contribution = channel_contribution.flatten()
 
             # Apply scale factor if in original scale
             if original_scale and scale_factor is not None:
-                channel_contributions *= scale_factor
+                channel_contribution *= scale_factor
 
             # Get allocated spend
             allocation_reduction_dims = [
@@ -554,7 +563,7 @@ class MMMPlotSuite:
                 ax,
                 samples.coords["channel"].values,
                 allocated_spend,
-                channel_contributions,
+                channel_contribution,
             )
 
             return fig, ax
@@ -619,15 +628,15 @@ class MMMPlotSuite:
                     for dim in subset.dims
                     if dim != "channel" and dim not in selection
                 ]
-                channel_contributions = subset.mean(dim=remaining_dims).to_numpy()
+                channel_contribution = subset.mean(dim=remaining_dims).to_numpy()
 
                 # Ensure 1D
-                if channel_contributions.ndim > 1:
-                    channel_contributions = channel_contributions.flatten()
+                if channel_contribution.ndim > 1:
+                    channel_contribution = channel_contribution.flatten()
 
                 # Apply scale factor if needed
                 if original_scale and scale_factor is not None:
-                    channel_contributions *= scale_factor
+                    channel_contribution *= scale_factor
 
                 # Select allocation data for this subplot
                 if all(dim in allocation_dims for dim in selection):
@@ -662,7 +671,7 @@ class MMMPlotSuite:
                     ax,
                     samples.coords["channel"].values,
                     allocated_spend,
-                    channel_contributions,
+                    channel_contribution,
                 )
 
                 # Add subplot title based on dimension values
@@ -683,7 +692,7 @@ class MMMPlotSuite:
         ax: plt.Axes,
         channels: NDArray,
         allocated_spend: NDArray,
-        channel_contributions: NDArray,
+        channel_contribution: NDArray,
     ) -> None:
         """Plot budget allocation bars on a given axis.
 
@@ -695,7 +704,7 @@ class MMMPlotSuite:
             Array of channel names.
         allocated_spend : NDArray
             Array of allocated spend values.
-        channel_contributions : NDArray
+        channel_contribution : NDArray
             Array of channel contribution values.
         """
         bar_width = 0.35
@@ -718,11 +727,11 @@ class MMMPlotSuite:
         # Plot contributions
         bars2 = ax2.bar(
             [i + bar_width for i in index],
-            channel_contributions,
+            channel_contribution,
             bar_width,
             color="C1",
             alpha=opacity,
-            label="Channel Contributions",
+            label="Channel Contribution",
         )
 
         # Labels and formatting
@@ -764,7 +773,7 @@ class MMMPlotSuite:
         ----------
         samples : xr.Dataset
             The dataset containing the samples of channel contributions.
-            Expected to have 'channel_contributions' variable with dimensions
+            Expected to have 'channel_contribution' variable with dimensions
             'channel', 'date', and 'sample'.
         scale_factor : float, optional
             Scale factor to convert to original scale, if original_scale=True.
@@ -828,23 +837,23 @@ class MMMPlotSuite:
             else:
                 fig = ax.get_figure()
 
-            channel_contributions = samples[channel_contrib_var]
+            channel_contribution = samples[channel_contrib_var]
 
             # Apply scale factor if in original scale
             if original_scale and scale_factor is not None:
-                channel_contributions = channel_contributions * scale_factor
+                channel_contribution = channel_contribution * scale_factor
 
             # Plot mean values by channel
-            channel_contributions.mean(dim="sample").plot(hue="channel", ax=ax)
+            channel_contribution.mean(dim="sample").plot(hue="channel", ax=ax)
 
             # Add uncertainty intervals for each channel
             for channel in samples.coords["channel"].values:
                 ax.fill_between(
-                    x=channel_contributions.date.values,
-                    y1=channel_contributions.sel(channel=channel).quantile(
+                    x=channel_contribution.date.values,
+                    y1=channel_contribution.sel(channel=channel).quantile(
                         lower_quantile, dim="sample"
                     ),
-                    y2=channel_contributions.sel(channel=channel).quantile(
+                    y2=channel_contribution.sel(channel=channel).quantile(
                         upper_quantile, dim="sample"
                     ),
                     alpha=0.1,
