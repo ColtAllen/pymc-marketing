@@ -16,10 +16,12 @@
 import warnings
 from collections.abc import Sequence
 
+import arviz as az
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pymc as pm
+import xarray as xr
 from matplotlib.lines import Line2D
 
 from pymc_marketing.clv import BetaGeoModel, ParetoNBDModel
@@ -482,6 +484,7 @@ def plot_expected_purchases_ppc(
     ppc: str = "posterior",
     max_purchases: int = 10,
     samples: int = 1000,
+    hdi_prob: float = 0.94,
     random_seed: int = 45,
     ax: plt.Axes | None = None,
     **kwargs,
@@ -504,6 +507,8 @@ def plot_expected_purchases_ppc(
         Cutoff for bars of purchase counts to plot. Default is 10.
     samples : int, optional
         Number of samples to draw for prior predictive checks. This is not used for posterior predictive checks.
+    hdi_prob: float, optional
+        Probability mass for highest density interval. Default is 0.94.
     random_seed : int, optional
         Random seed to fix sampling results
     ax : matplotlib.Axes, optional
@@ -550,26 +555,84 @@ def plot_expected_purchases_ppc(
         case _:
             raise NameError("Specify 'prior' or 'posterior' for 'ppc' parameter.")
 
-    # convert estimated and observed xarrays into dataframes for plotting
-    estimated = ppc_freq.to_dataframe().value_counts(normalize=True).sort_index()
-    observed = obs_freq.to_dataframe().value_counts(normalize=True).sort_index()
+    # create frequency bins
+    # purchase_counts = np.arange(max_purchases + 1)
 
-    # PPC histogram plot
-    ax = pd.DataFrame(
-        {
-            "Estimated": estimated.reset_index()["proportion"].head(max_purchases),
-            "Observed": observed.reset_index()["proportion"].head(max_purchases),
-        },
-    ).plot(
-        kind="bar",
-        ax=ax,
-        title=title,
-        xlabel="Repeat Purchases",
-        ylabel="% of Customer Population",
-        rot=0.0,
-        **kwargs,
+    # calculate proportions for each purchase count across all chains/draws
+    proportions = np.zeros(
+        (max_purchases + 1, ppc_freq.sizes["chain"], ppc_freq.sizes["draw"])
     )
+
+    for i in range(max_purchases + 1):
+        if i == max_purchases:
+            # count purchases >= max_purchases
+            count = (ppc_freq >= max_purchases).sum("customer_id")
+        else:
+            # count exact purchase count
+            count = (ppc_freq == i).sum("customer_id")
+        proportions[i] = count / ppc_freq.sizes["customer_id"]
+
+    # convert to xarray with proper dimensions
+    proportions = xr.DataArray(
+        proportions,
+        dims=["purchase_count", "chain", "draw"],
+        coords={
+            "purchase_count": range(max_purchases + 1),
+            "chain": ppc_freq.coords["chain"],
+            "draw": ppc_freq.coords["draw"],
+        },
+    )
+
+    # calculate HDI intervals of purchase count proportions
+    hdi_intervals = az.hdi(
+        proportions, hdi_prob=hdi_prob, input_core_dims=[["chain", "draw"]]
+    )
+
+    # convert observed xarray into dataframe for plotting
+    # estimated = ppc_freq.to_dataframe().value_counts(normalize=True).sort_index()
+    observed = obs_freq.to_dataframe().value_counts(normalize=True).sort_index()
+    estimated_means = proportions.mean(("chain", "draw"))
+
+    # plot with error bars
+    x_pos = range(max_purchases + 1)
+
+    ax.bar(
+        x_pos,
+        estimated_means,
+        yerr=[
+            estimated_means - hdi_intervals.sel(hdi="lower"),
+            hdi_intervals.sel(hdi="higher") - estimated_means,
+        ],
+        alpha=0.7,
+        label="Estimated (with HDI)",
+    )
+
+    # plot observed data
+    ax.bar(
+        x_pos,
+        observed.reset_index()["proportion"].head(max_purchases + 1),
+        alpha=0.5,
+        label="Observed",
+    )
+
     return ax
+
+    # # PPC histogram plot
+    # ax = pd.DataFrame(
+    #     {
+    #         "Estimated": estimated.reset_index()["proportion"].head(max_purchases),
+    #         "Observed": observed.reset_index()["proportion"].head(max_purchases),
+    #     },
+    # ).plot(
+    #     kind="bar",
+    #     ax=ax,
+    #     title=title,
+    #     xlabel="Repeat Purchases",
+    #     ylabel="% of Customer Population",
+    #     rot=0.0,
+    #     **kwargs,
+    # )
+    # return ax
 
 
 def _force_aspect(ax: plt.Axes, aspect=1):
