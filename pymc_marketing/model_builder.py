@@ -641,6 +641,7 @@ class ModelBuilder(ABC, ModelIO):
     @abstractmethod
     def build_model(
         self,
+        data: pd.DataFrame,
         **kwargs,
     ) -> None:
         """Create an instance of `pm.Model` based on provided data and model_config.
@@ -649,6 +650,8 @@ class ModelBuilder(ABC, ModelIO):
 
         Parameters
         ----------
+        data : pd.DataFrame
+            The data to be used for building the model.
         kwargs : dict
             data arguments for model configuration.
 
@@ -662,22 +665,78 @@ class ModelBuilder(ABC, ModelIO):
 
         """
 
-    # TODO: Convert from abstract method into a base fitter for all models.
-    @abstractmethod
+    def create_fit_data(fit_data) -> xr.Dataset:
+        """Create the fit_data group based on the input data."""
+        if isinstance(fit_data, pd.DataFrame):
+            return fit_data.to_xarray()
+        return fit_data
+
     def fit(
         self,
-        **kwargs,
+        fit_data: pd.DataFrame,
+        progressbar: bool | None = None,
+        random_seed: RandomState | None = None,
+        **kwargs: Any,
     ) -> az.InferenceData:
-        """Fit a model using the data passed as a parameter.
+        """Fit a model using the data provided at initialization.
 
         Sets attrs to inference data of the model.
+
+        Parameters
+        ----------
+        fit_data : pd.DataFrame
+            The data to be used for fitting the model.
+        progressbar : bool, optional
+            Specifies whether the fit progress bar should be displayed. Defaults to True.
+        random_seed : Optional[RandomState]
+            Provides sampler with initial random seed for obtaining reproducible samples.
+        **kwargs : Any
+            Custom sampler settings can be provided in form of keyword arguments.
 
         Returns
         -------
         self : az.InferenceData
             Returns inference data of the fitted model.
 
+        Examples
+        --------
+        >>> 	model = MyModel()
+        >>> 	idata = model.fit()
+        Auto-assigning NUTS sampler...
+        Initializing NUTS using jitter+adapt_diag...
         """
+        if not hasattr(self, "model"):
+            self.build_model(fit_data)
+
+        sampler_kwargs = create_sample_kwargs(
+            self.sampler_config,
+            progressbar,
+            random_seed,
+            **kwargs,
+        )
+        with self.model:
+            idata = pm.sample(**sampler_kwargs)
+
+        if self.idata:
+            self.idata = self.idata.copy()
+            self.idata.extend(idata, join="right")
+        else:
+            self.idata = idata
+
+        if "fit_data" in self.idata:
+            del self.idata.fit_data
+
+        fit_data = self.create_fit_data(fit_data)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message="The group fit_data is not defined in the InferenceData scheme",
+            )
+            self.idata.add_groups(fit_data=fit_data)
+        self.set_idata_attrs(self.idata)
+        return self.idata  # type: ignore
 
     @requires_model
     def graphviz(self, **kwargs):
