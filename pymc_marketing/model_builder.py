@@ -665,20 +665,29 @@ class ModelBuilder(ABC, ModelIO):
 
         """
 
-    def create_fit_data(fit_data) -> xr.Dataset:
+    def _create_fit_data(fit_data) -> xr.Dataset:
         """Create the fit_data group based on the input data."""
         if isinstance(fit_data, pd.DataFrame):
-            return fit_data.to_xarray()
-        return fit_data
+            fit_data = fit_data.to_xarray()
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message="The group fit_data is not defined in the InferenceData scheme",
+            )
+            self.idata.add_groups(fit_data=fit_data)
 
     def fit(
         self,
         fit_data: pd.DataFrame,
+        method: str = "mcmc",
+        fit_method: str | None = None,
         progressbar: bool | None = None,
         random_seed: RandomState | None = None,
         **kwargs: Any,
     ) -> az.InferenceData:
-        """Fit a model using the data provided at initialization.
+        """Fit a model with the provided data.
 
         Sets attrs to inference data of the model.
 
@@ -686,6 +695,14 @@ class ModelBuilder(ABC, ModelIO):
         ----------
         fit_data : pd.DataFrame
             The data to be used for fitting the model.
+        method: str
+            Method used to fit the model:
+            - "mcmc": Samples from the posterior via `pymc.sample` (default)
+            - "map": Finds maximum a posteriori via `pymc.find_MAP`
+            - "demz": Samples from the posterior via `pymc.sample` using DEMetropolisZ
+            - "advi": Samples from the posterior via `pymc.fit(method="advi")` and `pymc.sample`
+            - "fullrank_advi": Samples from the posterior via `pymc.fit(method="fullrank_advi")` and `pymc.sample`
+        kwargs:
         progressbar : bool, optional
             Specifies whether the fit progress bar should be displayed. Defaults to True.
         random_seed : Optional[RandomState]
@@ -701,11 +718,21 @@ class ModelBuilder(ABC, ModelIO):
         Examples
         --------
         >>> 	model = MyModel()
-        >>> 	idata = model.fit()
+        >>> 	idata = model.fit(fit_data)
         Auto-assigning NUTS sampler...
         Initializing NUTS using jitter+adapt_diag...
         """
+        if fit_method:
+            warnings.warn(
+                "'fit_method' is deprecated and will be removed in a future release. "
+                "Use 'method' instead.",
+                DeprecationWarning,
+                stacklevel=1,
+            )
+            method = fit_method
+
         if not hasattr(self, "model"):
+            # TODO: type: ignore?
             self.build_model(fit_data)
 
         sampler_kwargs = create_sample_kwargs(
@@ -731,18 +758,11 @@ class ModelBuilder(ABC, ModelIO):
         else:
             self.idata = idata
 
+        # overwrite existing fit_data
         if "fit_data" in self.idata:
             del self.idata.fit_data
 
-        fit_data = self.create_fit_data(fit_data)
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            self.idata.add_groups(fit_data=fit_data)
+        self._create_fit_data(fit_data)
 
         self.set_idata_attrs(self.idata)
         self.idata["posterior"].attrs["pymc_marketing_version"] = __version__

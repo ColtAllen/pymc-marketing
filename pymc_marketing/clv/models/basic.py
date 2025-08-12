@@ -99,15 +99,15 @@ class CLVModel(ModelBuilder):
         else:
             return f"{self._model_type}\n{self.model.str_repr()}"
 
-    def _add_fit_data_group(self, data: pd.DataFrame) -> None:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            assert self.idata is not None  # noqa: S101
-            self.idata.add_groups(fit_data=data.to_xarray())
+    # def _add_fit_data_group(self, data: pd.DataFrame) -> None:
+    #     with warnings.catch_warnings():
+    #         warnings.filterwarnings(
+    #             "ignore",
+    #             category=UserWarning,
+    #             message="The group fit_data is not defined in the InferenceData scheme",
+    #         )
+    #         assert self.idata is not None  # noqa: S101
+    #         self.idata.add_groups(fit_data=data.to_xarray())
 
     def fit(  # type: ignore
         self,
@@ -130,16 +130,16 @@ class CLVModel(ModelBuilder):
             Other keyword arguments passed to the underlying PyMC routines
 
         """
-        self.build_model()  # type: ignore
+        # self.build_model()  # type: ignore
 
-        if fit_method:
-            warnings.warn(
-                "'fit_method' is deprecated and will be removed in a future release. "
-                "Use 'method' instead.",
-                DeprecationWarning,
-                stacklevel=1,
-            )
-            method = fit_method
+        # if fit_method:
+        #     warnings.warn(
+        #         "'fit_method' is deprecated and will be removed in a future release. "
+        #         "Use 'method' instead.",
+        #         DeprecationWarning,
+        #         stacklevel=1,
+        #     )
+        #     method = fit_method
 
         approx = None
         match method:
@@ -158,14 +158,14 @@ class CLVModel(ModelBuilder):
                     f"Fit method options are ['mcmc', 'map', 'demz', 'advi', 'fullrank_advi'], got: {method}"
                 )
 
-        self.idata = idata
+        # self.idata = idata
         if approx:
             self.approx = approx
-        self.set_idata_attrs(self.idata)
-        if self.data is not None:
-            self._add_fit_data_group(self.data)
+        # self.set_idata_attrs(self.idata)
+        # if self.data is not None:
+        #     self._add_fit_data_group(self.data)
 
-        return self.idata
+        # return self.idata
 
     def _fit_mcmc(self, **kwargs) -> az.InferenceData:
         """Fit a model with NUTS."""
