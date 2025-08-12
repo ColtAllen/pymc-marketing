@@ -714,8 +714,16 @@ class ModelBuilder(ABC, ModelIO):
             random_seed,
             **kwargs,
         )
+        # Sample without deterministics first
+        var_names = [var.name for var in self.model.free_RVs]
         with self.model:
-            idata = pm.sample(**sampler_kwargs)
+            idata = pm.sample(var_names=var_names, **sampler_kwargs)
+
+        # Compute deterministics after sampling
+        with self.model:
+            idata.posterior = pm.compute_deterministics(
+                idata.posterior, merge_dataset=True
+            )
 
         if self.idata:
             self.idata = self.idata.copy()
@@ -735,7 +743,10 @@ class ModelBuilder(ABC, ModelIO):
                 message="The group fit_data is not defined in the InferenceData scheme",
             )
             self.idata.add_groups(fit_data=fit_data)
+
         self.set_idata_attrs(self.idata)
+        self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
+
         return self.idata  # type: ignore
 
     @requires_model
@@ -944,25 +955,6 @@ class RegressionModelBuilder(ModelBuilder):
 
         self.build_model(X, y)  # type: ignore
 
-    def create_fit_data(
-        self,
-        X: pd.DataFrame | xr.Dataset | xr.DataArray,
-        y: np.ndarray | pd.Series | xr.DataArray,
-    ) -> xr.Dataset:
-        """Create the fit_data group based on the input data."""
-        if isinstance(y, np.ndarray):
-            y = pd.Series(y, index=X.index, name=self.output_var)
-
-        y.name = self.output_var
-
-        if isinstance(X, pd.DataFrame):
-            X = X.to_xarray()
-
-        if isinstance(y, pd.Series):
-            y = y.to_xarray()
-
-        return xr.merge([X, y])
-
     def post_sample_model_transformation(self) -> None:
         """Perform transformation on the model after sampling."""
         pass
@@ -1015,55 +1007,32 @@ class RegressionModelBuilder(ModelBuilder):
         if y is None:
             y = np.zeros(X.shape[0])
 
+        if isinstance(y, np.ndarray):
+            y = pd.Series(y, index=X.index, name=self.output_var)
+
+        # TODO: Check if this is needed
+        #y.name = self.output_var
+
         if self.output_var in X:
             raise ValueError(
                 f"X includes a column named '{self.output_var}', which conflicts with the target variable."
             )
 
+        if isinstance(X, pd.DataFrame):
+            X = X.to_xarray()
+
+        if isinstance(y, pd.Series):
+            y = y.to_xarray()
+
         if not hasattr(self, "model"):
             self.build_model(X, y)
 
-        sampler_kwargs = create_sample_kwargs(
-            self.sampler_config,
-            progressbar,
-            random_seed,
-            **kwargs,
-        )
+        fit_data = xr.merge([X, y])
 
-        # Sample without deterministics first
-        var_names = [var.name for var in self.model.free_RVs]
-        with self.model:
-            idata = pm.sample(var_names=var_names, **sampler_kwargs)
-
-        # Compute deterministics after sampling
-        with self.model:
-            idata.posterior = pm.compute_deterministics(
-                idata.posterior, merge_dataset=True
-            )
+        self.idata = super().fit(fit_data, progressbar, random_seed, **kwargs)
 
         self.post_sample_model_transformation()
 
-        if self.idata:
-            self.idata = self.idata.copy()
-            self.idata.extend(idata, join="right")
-        else:
-            self.idata = idata
-
-        self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
-
-        if "fit_data" in self.idata:
-            del self.idata.fit_data
-
-        fit_data = self.create_fit_data(X, y)
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            self.idata.add_groups(fit_data=fit_data)
-        self.set_idata_attrs(self.idata)
         return self.idata  # type: ignore
 
     def predict(
