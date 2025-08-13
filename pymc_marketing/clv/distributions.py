@@ -898,54 +898,42 @@ class ModifiedBetaGeoNBD(PositiveContinuous):
 # TODO: This is only for testing until added and available in pymc-extras! Delete afterward
 class GrassiaIIGeometricRV(RandomVariable):
     name = "g2g"
-    signature = "(),(),()->()"
-    ndims_params = [
-        0,
-        0,
-        0,
-    ]  # deprecated in PyTensor 2.31.7, but still required for RandomVariable
+    signature = "(),(),(t)->()"
 
     dtype = "int64"
     _print_name = ("GrassiaIIGeometric", "\\operatorname{GrassiaIIGeometric}")
 
     @classmethod
     def rng_fn(cls, rng, r, alpha, time_covariate_vector, size):
-        # Cast inputs as numpy arrays
-        r = np.asarray(r, dtype=np.float64)
-        alpha = np.asarray(alpha, dtype=np.float64)
-        time_covariate_vector = np.asarray(time_covariate_vector, dtype=np.float64)
+        # Aggregate time covariates for each sample before broadcasting
+        time_cov = np.asarray(time_covariate_vector)
+        if np.ndim(time_cov) == 0:
+            exp_time_covar = np.asarray(1.0)
+        else:
+            # Collapse all time/feature axes to a scalar multiplier for RNG
+            exp_time_covar = np.asarray(np.exp(time_cov).sum())
 
         # Determine output size
         if size is None:
-            size = np.broadcast_shapes(
-                r.shape, alpha.shape, time_covariate_vector.shape
-            )
+            size = np.broadcast_shapes(r.shape, alpha.shape, exp_time_covar.shape)
 
         # Broadcast parameters to output size
         r = np.broadcast_to(r, size)
         alpha = np.broadcast_to(alpha, size)
-        time_covariate_vector = np.broadcast_to(time_covariate_vector, size)
+        exp_time_covar = np.broadcast_to(exp_time_covar, size)
 
         lam = rng.gamma(shape=r, scale=1 / alpha, size=size)
 
-        # Calculate exp(time_covariate_vector) for all samples
-        exp_time_covar = np.exp(time_covariate_vector)
         lam_covar = lam * exp_time_covar
 
-        # TODO: This is not aggregated over time
         p = 1 - np.exp(-lam_covar)
-
-        # Ensure p is in valid range for geometric distribution
-        min_p = max(
-            1e-6, np.finfo(float).tiny
-        )  # Minimum probability to prevent infinite values
-        p = np.clip(p, min_p, 1.0)
-
+        # TODO: This is a hack to ensure valid probability in (0, 1]
+        # We should find a better way to do this.
+        # Ensure valid probability in (0, 1]
+        tiny = np.finfo(p.dtype).tiny
+        p = np.clip(p, tiny, 1.0)
         samples = rng.geometric(p)
-
-        # Clip samples to reasonable bounds to prevent infinite values
-        max_sample = 10000  # Reasonable upper bound for discrete time-to-event data
-        samples = np.clip(samples, 1, max_sample)
+        # samples = np.ceil(np.log(1 - rng.uniform(size=size)) / (-lam_covar))
 
         return samples
 
@@ -953,7 +941,7 @@ class GrassiaIIGeometricRV(RandomVariable):
 g2g = GrassiaIIGeometricRV()
 
 
-# TODO: This is only for testing until added and available in pymc-extras! Delete afterward
+# TODO: Add covariate expressions to docstrings.
 class GrassiaIIGeometric(Discrete):
     r"""Grassia(II)-Geometric distribution.
 
@@ -997,8 +985,8 @@ class GrassiaIIGeometric(Discrete):
         Shape parameter (r > 0).
     alpha : tensor_like of float
         Scale parameter (alpha > 0).
-    time_covariate_vector : tensor_like of float, optional
-        Optional vector containing dot products of time-varying covariates and coefficients.
+    time_covariate_vector : tensor_like of float
+        Vector containing dot products of time-varying covariates and coefficients.
 
     References
     ----------
@@ -1013,44 +1001,32 @@ class GrassiaIIGeometric(Discrete):
     def dist(cls, r, alpha, time_covariate_vector=None, *args, **kwargs):
         r = pt.as_tensor_variable(r)
         alpha = pt.as_tensor_variable(alpha)
+
         if time_covariate_vector is None:
             time_covariate_vector = pt.constant(0.0)
         time_covariate_vector = pt.as_tensor_variable(time_covariate_vector)
+        # Normalize covariate to be 1D over time
+        if time_covariate_vector.ndim == 0:
+            time_covariate_vector = pt.reshape(time_covariate_vector, (1,))
+        elif time_covariate_vector.ndim > 1:
+            feature_axes = tuple(range(time_covariate_vector.ndim - 1))
+            time_covariate_vector = pt.sum(time_covariate_vector, axis=feature_axes)
+
         return super().dist([r, alpha, time_covariate_vector], *args, **kwargs)
 
-    def logp(value, r, alpha, time_covariate_vector=None):
-        if time_covariate_vector is None:
-            time_covariate_vector = pt.constant(0.0)
-        time_covariate_vector = pt.as_tensor_variable(time_covariate_vector)
+    def logp(value, r, alpha, time_covariate_vector):
+        v = pt.as_tensor_variable(value)
+        ct_prev = C_t(v - 1, time_covariate_vector)
+        ct_curr = C_t(v, time_covariate_vector)
+        logS_prev = r * (pt.log(alpha) - pt.log(alpha + ct_prev))
+        logS_curr = r * (pt.log(alpha) - pt.log(alpha + ct_curr))
+        # Compute log(exp(logS_prev) - exp(logS_curr)) stably
+        max_logS = pt.maximum(logS_prev, logS_curr)
+        diff = pt.exp(logS_prev - max_logS) - pt.exp(logS_curr - max_logS)
+        logp = max_logS + pt.log(diff)
 
-        def C_t(t):
-            if t == 0:
-                return pt.constant(0.0)
-            if time_covariate_vector.ndim == 0:
-                return t
-            else:
-                # Ensure t is a valid index
-                t_idx = pt.maximum(0, t - 1)  # Convert to 0-based indexing
-                # If t_idx exceeds length of time_covariate_vector, use last value
-                max_idx = pt.shape(time_covariate_vector)[0] - 1
-                safe_idx = pt.minimum(t_idx, max_idx)
-                covariate_value = time_covariate_vector[safe_idx]
-                return t * pt.exp(covariate_value)
-
-        logp = pt.log(
-            pt.pow(alpha / (alpha + C_t(value - 1)), r)
-            - pt.pow(alpha / (alpha + C_t(value)), r)
-        )
-
-        # Handle invalid values
-        logp = pt.switch(
-            pt.or_(
-                value < 1,  # Value must be >= 1
-                pt.isnan(logp),  # Handle NaN cases
-            ),
-            -np.inf,
-            logp,
-        )
+        # Handle invalid / out-of-domain values
+        logp = pt.switch(value < 1, -np.inf, logp)
 
         return check_parameters(
             logp,
@@ -1059,27 +1035,17 @@ class GrassiaIIGeometric(Discrete):
             msg="r > 0, alpha > 0",
         )
 
-    def logcdf(value, r, alpha, time_covariate_vector=None):
-        if time_covariate_vector is None:
-            time_covariate_vector = pt.constant(0.0)
-        time_covariate_vector = pt.as_tensor_variable(time_covariate_vector)
-
-        def C_t(t):
-            if t == 0:
-                return pt.constant(0.0)
-            if time_covariate_vector.ndim == 0:
-                return t
-            else:
-                # Ensure t is a valid index
-                t_idx = pt.maximum(0, t - 1)  # Convert to 0-based indexing
-                # If t_idx exceeds length of time_covariate_vector, use last value
-                max_idx = pt.shape(time_covariate_vector)[0] - 1
-                safe_idx = pt.minimum(t_idx, max_idx)
-                covariate_value = time_covariate_vector[safe_idx]
-                return t * pt.exp(covariate_value)
-
-        survival = pt.pow(alpha / (alpha + C_t(value)), r)
-        logcdf = pt.log(1 - survival)
+    def logcdf(value, r, alpha, time_covariate_vector):
+        # Log CDF: log(1 - (alpha / (alpha + C(t)))**r)
+        t = pt.as_tensor_variable(value)
+        ct = C_t(t, time_covariate_vector)
+        logS = r * (pt.log(alpha) - pt.log(alpha + ct))
+        # Numerically stable log(1 - exp(logS))
+        logcdf = pt.switch(
+            pt.lt(logS, np.log(0.5)),
+            pt.log1p(-pt.exp(logS)),
+            pt.log(-pt.expm1(logS)),
+        )
 
         return check_parameters(
             logcdf,
@@ -1088,7 +1054,7 @@ class GrassiaIIGeometric(Discrete):
             msg="r > 0, alpha > 0",
         )
 
-    def support_point(rv, size, r, alpha, time_covariate_vector=None):
+    def support_point(rv, size, r, alpha, time_covariate_vector):
         """Calculate a reasonable starting point for sampling.
 
         For the GrassiaIIGeometric distribution, we use a point estimate based on
@@ -1099,9 +1065,6 @@ class GrassiaIIGeometric(Discrete):
         When time_covariate_vector is provided, it affects the expected value through
         the exponential link function: exp(time_covariate_vector).
         """
-        if time_covariate_vector is None:
-            time_covariate_vector = pt.constant(0.0)
-
         base_lambda = r / alpha
 
         # Approximate expected value of geometric distribution
@@ -1111,8 +1074,11 @@ class GrassiaIIGeometric(Discrete):
             1.0 / (1.0 - pt.exp(-base_lambda)),  # Full expression for larger lambda
         )
 
-        # Apply time covariates if provided
-        mean = mean * pt.exp(time_covariate_vector)
+        # Apply time covariates if provided: multiply by exp(sum over axis=0)
+        # This yields a scalar for 1D covariates and a time-length vector for 2D (features x time)
+        tcv = pt.as_tensor_variable(time_covariate_vector)
+        if tcv.ndim != 0:
+            mean = mean * pt.exp(tcv.sum(axis=0))
 
         # Round up to nearest integer and ensure >= 1
         mean = pt.maximum(pt.ceil(mean), 1.0)
@@ -1122,3 +1088,33 @@ class GrassiaIIGeometric(Discrete):
             mean = pt.full(size, mean)
 
         return mean
+
+
+def C_t(
+    t: pt.TensorVariable, time_covariate_vector: pt.TensorVariable
+) -> pt.TensorVariable:
+    """Utility for processing time-varying covariates in GrassiaIIGeometric distribution."""
+    # If unspecified (scalar), simply return t
+    if time_covariate_vector.ndim == 0:
+        return t
+
+    # Sum exp(covariates) across feature axes, keep last axis as time
+    if time_covariate_vector.ndim == 1:
+        per_time_sum = pt.exp(time_covariate_vector)
+    else:
+        # If axis=0 is time and axis>0 are features, sum over features (axis>0)
+        per_time_sum = pt.sum(pt.exp(time_covariate_vector), axis=0)
+
+    # Build cumulative sum up to each t without advanced indexing
+    time_length = pt.shape(per_time_sum)[0]
+    # Ensure t is at least 1D int64 for broadcasting
+    t_vec = pt.cast(t, "int64")
+    t_vec = pt.shape_padleft(t_vec) if t_vec.ndim == 0 else t_vec
+    # Create time indices [0, 1, ..., T-1]
+    time_idx = pt.arange(time_length, dtype="int64")
+    # Mask where time index < t (exclusive upper bound)
+    mask = pt.lt(time_idx, pt.shape_padright(t_vec, 1))
+    # Sum per-time contributions over time axis
+    base_sum = pt.sum(pt.shape_padleft(per_time_sum) * mask, axis=-1)
+    # If original t was scalar, return scalar (saturate at last time step)
+    return pt.squeeze(base_sum)
