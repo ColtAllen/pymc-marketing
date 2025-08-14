@@ -20,13 +20,16 @@ from abc import ABC, abstractmethod
 from functools import wraps
 from inspect import signature
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
 import xarray as xr
+from pymc.backends import NDArray
+from pymc.backends.base import MultiTrace
+from pymc.model.core import Model
 from pymc.util import RandomState
 from pymc_extras.printing import model_table
 from rich.table import Table
@@ -665,7 +668,7 @@ class ModelBuilder(ABC, ModelIO):
 
         """
 
-    def _create_fit_data(fit_data) -> xr.Dataset:
+    def _create_fit_data(self, fit_data) -> xr.Dataset:
         """Create the fit_data group based on the input data."""
         if isinstance(fit_data, pd.DataFrame):
             fit_data = fit_data.to_xarray()
@@ -702,13 +705,13 @@ class ModelBuilder(ABC, ModelIO):
             - "demz": Samples from the posterior via `pymc.sample` using DEMetropolisZ
             - "advi": Samples from the posterior via `pymc.fit(method="advi")` and `pymc.sample`
             - "fullrank_advi": Samples from the posterior via `pymc.fit(method="fullrank_advi")` and `pymc.sample`
-        kwargs:
         progressbar : bool, optional
             Specifies whether the fit progress bar should be displayed. Defaults to True.
         random_seed : Optional[RandomState]
             Provides sampler with initial random seed for obtaining reproducible samples.
         **kwargs : Any
-            Custom sampler settings can be provided in form of keyword arguments.
+            Other keyword arguments passed to the underlying PyMC routines
+            For example, `tune`, `chains`, `target_accept`, etc.
 
         Returns
         -------
@@ -722,6 +725,13 @@ class ModelBuilder(ABC, ModelIO):
         Auto-assigning NUTS sampler...
         Initializing NUTS using jitter+adapt_diag...
         """
+        if fit_data is None:
+            raise DeprecationWarning(
+                "fit_data must now be provided as a parameter. "
+                "Not doing so will raise an error in a future release."
+            )
+            fit_data = self.data
+
         if fit_method:
             warnings.warn(
                 "'fit_method' is deprecated and will be removed in a future release. "
@@ -735,28 +745,42 @@ class ModelBuilder(ABC, ModelIO):
             # TODO: type: ignore?
             self.build_model(fit_data)
 
+        # TODO: Check these against other fit methods
         sampler_kwargs = create_sample_kwargs(
             self.sampler_config,
             progressbar,
             random_seed,
             **kwargs,
         )
-        # Sample without deterministics first
-        var_names = [var.name for var in self.model.free_RVs]
-        with self.model:
-            idata = pm.sample(var_names=var_names, **sampler_kwargs)
 
-        # Compute deterministics after sampling
-        with self.model:
-            idata.posterior = pm.compute_deterministics(
-                idata.posterior, merge_dataset=True
-            )
+        # needed for advi and fullrank_advi
+        approx = None
+
+        match method:
+            # TODO: Change this to "nuts"?
+            case "mcmc":
+                idata = self._fit_mcmc(**kwargs)
+            case "map":
+                idata = pm.find_MAP(self.model)
+            case "demz":
+                idata = pm.sample(self.model, method="DEMetropolisZ", **sampler_kwargs)
+            case "advi":
+                approx, idata = self._fit_approx(method="advi", **kwargs)
+            case "fullrank_advi":
+                approx, idata = self._fit_approx(method="fullrank_advi", **kwargs)
+            case _:
+                raise ValueError(
+                    f"Fit method options are ['mcmc', 'map', 'demz', 'advi', 'fullrank_advi'], got: {method}"
+                )
 
         if self.idata:
             self.idata = self.idata.copy()
             self.idata.extend(idata, join="right")
         else:
             self.idata = idata
+
+        if approx:
+            self.approx = approx
 
         # overwrite existing fit_data
         if "fit_data" in self.idata:
@@ -768,6 +792,116 @@ class ModelBuilder(ABC, ModelIO):
         self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
 
         return self.idata  # type: ignore
+
+    def _fit_mcmc(self, **sampler_kwargs) -> az.InferenceData:
+        """Fit a model with NUTS."""
+        # Sample without deterministics first
+        var_names = [var.name for var in self.model.free_RVs]
+        with self.model:
+            idata = pm.sample(var_names=var_names, **sampler_kwargs)
+        # Compute deterministics after sampling
+        with self.model:
+            idata.posterior = pm.compute_deterministics(
+                idata.posterior, merge_dataset=True
+            )
+        return idata
+
+    def _fit_MAP(self, **kwargs) -> az.InferenceData:
+        """Find model maximum a posteriori using scipy optimizer."""
+        model = self.model
+        map_res = pm.find_MAP(model=model, **kwargs)
+        # Filter non-value variables
+        value_vars_names = set(v.name for v in cast(Model, model).value_vars)
+        map_res = {k: v for k, v in map_res.items() if k in value_vars_names}
+        # Convert map result to InferenceData
+        map_strace = NDArray(model=model)
+        map_strace.setup(draws=1, chain=0)
+        map_strace.record(map_res)
+        map_strace.close()
+        trace = MultiTrace([map_strace])
+        return pm.to_inference_data(trace, model=model)
+
+    def _fit_DEMZ(self, **kwargs) -> az.InferenceData:
+        """Fit a model with DEMetropolisZ gradient-free sampler."""
+        sampler_config = {}
+        if self.sampler_config is not None:
+            sampler_config = self.sampler_config.copy()
+        sampler_config.update(**kwargs)
+        with self.model:
+            return pm.sample(step=pm.DEMetropolisZ(), **sampler_config)
+
+    def _fit_approx(
+        self, method: Literal["advi", "fullrank_advi"] = "advi", **kwargs
+    ) -> az.InferenceData:
+        """Fit a model with ADVI."""
+        sampler_config = {}
+        if self.sampler_config is not None:
+            sampler_config = self.sampler_config.copy()
+
+        sampler_config = {**sampler_config, **kwargs}
+        if sampler_config.get("method") is not None:
+            raise ValueError(
+                "The 'method' parameter is set in sampler_config. Cannot be called with 'advi'."
+            )
+
+        if sampler_config.get("chains", 1) > 1:
+            warnings.warn(
+                "The 'chains' parameter must be 1 with 'advi'. Sampling only 1 chain despite the provided parameter.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        with self.model:
+            approx = pm.fit(
+                method=method,
+                callbacks=[pm.callbacks.CheckParametersConvergence(diff="absolute")],
+                **{
+                    k: v
+                    for k, v in sampler_config.items()
+                    if k
+                    in [
+                        "n",
+                        "random_seed",
+                        "inf_kwargs",
+                        "start",
+                        "start_sigma",
+                        "score",
+                        "callbacks",
+                        "progressbar",
+                        "progressbar_theme",
+                        "obj_n_mc",
+                        "tf_n_mc",
+                        "obj_optimizer",
+                        "test_optimizer",
+                        "more_obj_params",
+                        "more_tf_params",
+                        "more_updates",
+                        "total_grad_norm_constraint",
+                        "fn_kwargs",
+                        "more_replacements",
+                    ]
+                },
+            )
+            return approx, approx.sample(
+                **{
+                    k: v
+                    for k, v in sampler_config.items()
+                    if k in ["draws", "random_seed", "return_inferencedata"]
+                }
+            )
+
+    def fit_summary(self, **kwargs):
+        """Compute the summary of the fit result."""
+        res = self.fit_result
+        # Map fitting only gives one value, so we return it. We use arviz
+        # just to get it nicely into a DataFrame
+        if res.chain.size == 1 and res.draw.size == 1:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = az.summary(self.fit_result, **kwargs, kind="stats")
+            return res["mean"].rename("value")
+        else:
+            return az.summary(self.fit_result, **kwargs)
 
     @requires_model
     def graphviz(self, **kwargs):
@@ -1031,7 +1165,7 @@ class RegressionModelBuilder(ModelBuilder):
             y = pd.Series(y, index=X.index, name=self.output_var)
 
         # TODO: Check if this is needed
-        #y.name = self.output_var
+        # y.name = self.output_var
 
         if self.output_var in X:
             raise ValueError(

@@ -15,15 +15,10 @@
 
 import warnings
 from collections.abc import Sequence
-from typing import Literal, cast
 
 import arviz as az
 import pandas as pd
-import pymc as pm
 from pydantic import ConfigDict, InstanceOf, validate_call
-from pymc.backends import NDArray
-from pymc.backends.base import MultiTrace
-from pymc.model.core import Model
 
 from pymc_marketing.model_builder import DifferentModelError, ModelBuilder
 from pymc_marketing.model_config import ModelConfig, parse_model_config
@@ -98,166 +93,6 @@ class CLVModel(ModelBuilder):
             return self._model_type
         else:
             return f"{self._model_type}\n{self.model.str_repr()}"
-
-    # def _add_fit_data_group(self, data: pd.DataFrame) -> None:
-    #     with warnings.catch_warnings():
-    #         warnings.filterwarnings(
-    #             "ignore",
-    #             category=UserWarning,
-    #             message="The group fit_data is not defined in the InferenceData scheme",
-    #         )
-    #         assert self.idata is not None  # noqa: S101
-    #         self.idata.add_groups(fit_data=data.to_xarray())
-
-    def fit(  # type: ignore
-        self,
-        method: str = "mcmc",
-        fit_method: str | None = None,
-        **kwargs,
-    ) -> az.InferenceData:
-        """Infer model posterior.
-
-        Parameters
-        ----------
-        method: str
-            Method used to fit the model. Options are:
-            - "mcmc": Samples from the posterior via `pymc.sample` (default)
-            - "map": Finds maximum a posteriori via `pymc.find_MAP`
-            - "demz": Samples from the posterior via `pymc.sample` using DEMetropolisZ
-            - "advi": Samples from the posterior via `pymc.fit(method="advi")` and `pymc.sample`
-            - "fullrank_advi": Samples from the posterior via `pymc.fit(method="fullrank_advi")` and `pymc.sample`
-        kwargs:
-            Other keyword arguments passed to the underlying PyMC routines
-
-        """
-        # self.build_model()  # type: ignore
-
-        # if fit_method:
-        #     warnings.warn(
-        #         "'fit_method' is deprecated and will be removed in a future release. "
-        #         "Use 'method' instead.",
-        #         DeprecationWarning,
-        #         stacklevel=1,
-        #     )
-        #     method = fit_method
-
-        approx = None
-        match method:
-            case "mcmc":
-                idata = self._fit_mcmc(**kwargs)
-            case "map":
-                idata = self._fit_MAP(**kwargs)
-            case "demz":
-                idata = self._fit_DEMZ(**kwargs)
-            case "advi":
-                approx, idata = self._fit_approx(method="advi", **kwargs)
-            case "fullrank_advi":
-                approx, idata = self._fit_approx(method="fullrank_advi", **kwargs)
-            case _:
-                raise ValueError(
-                    f"Fit method options are ['mcmc', 'map', 'demz', 'advi', 'fullrank_advi'], got: {method}"
-                )
-
-        # self.idata = idata
-        if approx:
-            self.approx = approx
-        # self.set_idata_attrs(self.idata)
-        # if self.data is not None:
-        #     self._add_fit_data_group(self.data)
-
-        # return self.idata
-
-    def _fit_mcmc(self, **kwargs) -> az.InferenceData:
-        """Fit a model with NUTS."""
-        sampler_config = {}
-        if self.sampler_config is not None:
-            sampler_config = self.sampler_config.copy()
-        sampler_config.update(**kwargs)
-        return pm.sample(**sampler_config, model=self.model)
-
-    def _fit_MAP(self, **kwargs) -> az.InferenceData:
-        """Find model maximum a posteriori using scipy optimizer."""
-        model = self.model
-        map_res = pm.find_MAP(model=model, **kwargs)
-        # Filter non-value variables
-        value_vars_names = set(v.name for v in cast(Model, model).value_vars)
-        map_res = {k: v for k, v in map_res.items() if k in value_vars_names}
-        # Convert map result to InferenceData
-        map_strace = NDArray(model=model)
-        map_strace.setup(draws=1, chain=0)
-        map_strace.record(map_res)
-        map_strace.close()
-        trace = MultiTrace([map_strace])
-        return pm.to_inference_data(trace, model=model)
-
-    def _fit_DEMZ(self, **kwargs) -> az.InferenceData:
-        """Fit a model with DEMetropolisZ gradient-free sampler."""
-        sampler_config = {}
-        if self.sampler_config is not None:
-            sampler_config = self.sampler_config.copy()
-        sampler_config.update(**kwargs)
-        with self.model:
-            return pm.sample(step=pm.DEMetropolisZ(), **sampler_config)
-
-    def _fit_approx(
-        self, method: Literal["advi", "fullrank_advi"] = "advi", **kwargs
-    ) -> az.InferenceData:
-        """Fit a model with ADVI."""
-        sampler_config = {}
-        if self.sampler_config is not None:
-            sampler_config = self.sampler_config.copy()
-
-        sampler_config = {**sampler_config, **kwargs}
-        if sampler_config.get("method") is not None:
-            raise ValueError(
-                "The 'method' parameter is set in sampler_config. Cannot be called with 'advi'."
-            )
-
-        if sampler_config.get("chains", 1) > 1:
-            warnings.warn(
-                "The 'chains' parameter must be 1 with 'advi'. Sampling only 1 chain despite the provided parameter.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        with self.model:
-            approx = pm.fit(
-                method=method,
-                callbacks=[pm.callbacks.CheckParametersConvergence(diff="absolute")],
-                **{
-                    k: v
-                    for k, v in sampler_config.items()
-                    if k
-                    in [
-                        "n",
-                        "random_seed",
-                        "inf_kwargs",
-                        "start",
-                        "start_sigma",
-                        "score",
-                        "callbacks",
-                        "progressbar",
-                        "progressbar_theme",
-                        "obj_n_mc",
-                        "tf_n_mc",
-                        "obj_optimizer",
-                        "test_optimizer",
-                        "more_obj_params",
-                        "more_tf_params",
-                        "more_updates",
-                        "total_grad_norm_constraint",
-                        "fn_kwargs",
-                        "more_replacements",
-                    ]
-                },
-            )
-            return approx, approx.sample(
-                **{
-                    k: v
-                    for k, v in sampler_config.items()
-                    if k in ["draws", "random_seed", "return_inferencedata"]
-                }
-            )
 
     @classmethod
     def idata_to_init_kwargs(cls, idata: az.InferenceData) -> dict:
@@ -345,16 +180,3 @@ class CLVModel(ModelBuilder):
     @property
     def _serializable_model_config(self) -> dict:
         return self.model_config
-
-    def fit_summary(self, **kwargs):
-        """Compute the summary of the fit result."""
-        res = self.fit_result
-        # Map fitting only gives one value, so we return it. We use arviz
-        # just to get it nicely into a DataFrame
-        if res.chain.size == 1 and res.draw.size == 1:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                res = az.summary(self.fit_result, **kwargs, kind="stats")
-            return res["mean"].rename("value")
-        else:
-            return az.summary(self.fit_result, **kwargs)
