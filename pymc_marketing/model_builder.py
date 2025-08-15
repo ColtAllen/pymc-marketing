@@ -683,7 +683,7 @@ class ModelBuilder(ABC, ModelIO):
 
     def fit(
         self,
-        fit_data: pd.DataFrame,
+        fit_data: pd.DataFrame | None = None,
         method: str = "mcmc",
         fit_method: str | None = None,
         progressbar: bool | None = None,
@@ -726,13 +726,15 @@ class ModelBuilder(ABC, ModelIO):
         Initializing NUTS using jitter+adapt_diag...
         """
         if fit_data is None:
-            raise DeprecationWarning(
+            warnings.warn(
                 "fit_data must now be provided as a parameter. "
-                "Not doing so will raise an error in a future release."
+                "Not doing so will raise an error in a future release.",
+                DeprecationWarning,
+                stacklevel=1,
             )
             fit_data = self.data
 
-        if fit_method:
+        if fit_method is not None:
             warnings.warn(
                 "'fit_method' is deprecated and will be removed in a future release. "
                 "Use 'method' instead.",
