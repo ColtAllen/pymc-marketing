@@ -176,9 +176,74 @@ def mock_idata() -> az.InferenceData:
 
 
 @pytest.fixture(scope="module")
+def mock_idata_with_sensitivity(mock_idata):
+    # Copy the mock_idata so we don't mutate the shared fixture
+    idata = mock_idata.copy()
+    n_chain, n_draw, n_sweep = 2, 10, 5
+    sweep = np.linspace(0.5, 1.5, n_sweep)
+    # Add a single extra dim for multi-panel test
+    extra_dim = ["A", "B"]
+    # y and marginal_effects: dims (chain, draw, sweep, extra)
+    y = xr.DataArray(
+        np.random.normal(0, 1, size=(n_chain, n_draw, n_sweep, len(extra_dim))),
+        dims=("chain", "draw", "sweep", "region"),
+        coords={
+            "chain": np.arange(n_chain),
+            "draw": np.arange(n_draw),
+            "sweep": sweep,
+            "region": extra_dim,
+        },
+    )
+    marginal_effects = xr.DataArray(
+        np.random.normal(0, 1, size=(n_chain, n_draw, n_sweep, len(extra_dim))),
+        dims=("chain", "draw", "sweep", "region"),
+        coords={
+            "chain": np.arange(n_chain),
+            "draw": np.arange(n_draw),
+            "sweep": sweep,
+            "region": extra_dim,
+        },
+    )
+    # Add sweep_type and var_names as attrs/coords
+    sensitivity_analysis = xr.Dataset(
+        {"y": y, "marginal_effects": marginal_effects},
+        coords={"sweep": sweep, "region": extra_dim},
+        attrs={"sweep_type": "multiplicative", "var_names": "test_var"},
+    )
+    # Attach to idata
+    idata.sensitivity_analysis = sensitivity_analysis
+    # Add posterior_predictive for percentage test
+    idata.posterior_predictive = xr.Dataset(
+        {
+            "y": xr.DataArray(
+                np.abs(
+                    np.random.normal(
+                        10, 2, size=(n_chain, n_draw, n_sweep, len(extra_dim))
+                    )
+                ),
+                dims=("chain", "draw", "sweep", "region"),
+                coords={
+                    "chain": np.arange(n_chain),
+                    "draw": np.arange(n_draw),
+                    "sweep": sweep,
+                    "region": extra_dim,
+                },
+            )
+        }
+    )
+    return idata
+
+
+@pytest.fixture(scope="module")
 def mock_suite(mock_idata):
     """Fixture to create a mock MMMPlotSuite with a mocked posterior."""
     return MMMPlotSuite(idata=mock_idata)
+
+
+@pytest.fixture(scope="module")
+def mock_suite_with_sensitivity(mock_idata_with_sensitivity):
+    """Fixture to create a mock MMMPlotSuite with sensitivity analysis."""
+    return MMMPlotSuite(idata=mock_idata_with_sensitivity)
 
 
 def test_contributions_over_time_expand_dims(mock_suite: MMMPlotSuite):
@@ -495,3 +560,159 @@ def test_saturation_curves_scatter_deprecation_warning(mock_suite_with_constant_
     assert isinstance(fig, Figure)
     assert isinstance(axes, np.ndarray)
     assert all(isinstance(ax, Axes) for ax in axes.flat)
+
+
+@pytest.fixture(scope="module")
+def mock_idata_with_constant_data_single_dim() -> az.InferenceData:
+    """Mock InferenceData where channel_data has only ('date','channel') dims."""
+    seed = sum(map(ord, "Saturation single-dim tests"))
+    rng = np.random.default_rng(seed)
+    normal = rng.normal
+
+    dates = pd.date_range("2025-01-01", periods=12, freq="W-MON")
+    channels = ["channel_1", "channel_2", "channel_3"]
+
+    posterior = xr.Dataset(
+        {
+            "channel_contribution": xr.DataArray(
+                normal(size=(2, 10, 12, 3)),
+                dims=("chain", "draw", "date", "channel"),
+                coords={
+                    "chain": np.arange(2),
+                    "draw": np.arange(10),
+                    "date": dates,
+                    "channel": channels,
+                },
+            ),
+            "channel_contribution_original_scale": xr.DataArray(
+                normal(size=(2, 10, 12, 3)) * 100.0,
+                dims=("chain", "draw", "date", "channel"),
+                coords={
+                    "chain": np.arange(2),
+                    "draw": np.arange(10),
+                    "date": dates,
+                    "channel": channels,
+                },
+            ),
+        }
+    )
+
+    constant_data = xr.Dataset(
+        {
+            "channel_data": xr.DataArray(
+                rng.uniform(0, 10, size=(12, 3)),
+                dims=("date", "channel"),
+                coords={"date": dates, "channel": channels},
+            ),
+            "channel_scale": xr.DataArray(
+                [100.0, 150.0, 200.0], dims=("channel",), coords={"channel": channels}
+            ),
+            "target_scale": xr.DataArray(
+                [1000.0], dims="target", coords={"target": ["y"]}
+            ),
+        }
+    )
+
+    return az.InferenceData(posterior=posterior, constant_data=constant_data)
+
+
+@pytest.fixture(scope="module")
+def mock_suite_with_constant_data_single_dim(mock_idata_with_constant_data_single_dim):
+    return MMMPlotSuite(idata=mock_idata_with_constant_data_single_dim)
+
+
+@pytest.fixture(scope="module")
+def mock_saturation_curve_single_dim() -> xr.DataArray:
+    """Saturation curve with dims ('chain','draw','channel','x')."""
+    seed = sum(map(ord, "Saturation curve single-dim"))
+    rng = np.random.default_rng(seed)
+    x_values = np.linspace(0, 1, 50)
+    channels = ["channel_1", "channel_2", "channel_3"]
+
+    # shape: (chains=2, draws=10, channel=3, x=50)
+    curve_array = np.empty((2, 10, len(channels), len(x_values)))
+    for ci in range(2):
+        for di in range(10):
+            for c in range(len(channels)):
+                curve_array[ci, di, c, :] = x_values / (1 + x_values) + rng.normal(
+                    0, 0.02, size=x_values.shape
+                )
+
+    return xr.DataArray(
+        curve_array,
+        dims=("chain", "draw", "channel", "x"),
+        coords={
+            "chain": np.arange(2),
+            "draw": np.arange(10),
+            "channel": channels,
+            "x": x_values,
+        },
+        name="saturation_curve",
+    )
+
+
+def test_saturation_curves_single_dim_axes_shape(
+    mock_suite_with_constant_data_single_dim, mock_saturation_curve_single_dim
+):
+    """When there are no extra dims, columns should default to 1 (no ncols=0)."""
+    fig, axes = mock_suite_with_constant_data_single_dim.saturation_curves(
+        curve=mock_saturation_curve_single_dim, n_samples=3
+    )
+
+    assert isinstance(fig, Figure)
+    assert isinstance(axes, np.ndarray)
+    # Expect (n_channels, 1)
+    assert axes.shape[1] == 1
+    assert axes.shape[0] == mock_saturation_curve_single_dim.sizes["channel"]
+
+
+def test_saturation_curves_multi_dim_axes_shape(
+    mock_suite_with_constant_data, mock_saturation_curve
+):
+    """With an extra dim (e.g., 'country'), expect (n_channels, n_countries)."""
+    fig, axes = mock_suite_with_constant_data.saturation_curves(
+        curve=mock_saturation_curve, n_samples=2
+    )
+
+    assert isinstance(fig, Figure)
+    assert isinstance(axes, np.ndarray)
+    n_channels = mock_saturation_curve.sizes["channel"]
+    n_countries = mock_suite_with_constant_data.idata.constant_data.channel_data.sizes[
+        "country"
+    ]
+    assert axes.shape == (n_channels, n_countries)
+
+
+def test_plot_sensitivity_analysis_basic(mock_suite_with_sensitivity):
+    # Should return (fig, axes) for multi-panel
+    fig, axes = mock_suite_with_sensitivity.plot_sensitivity_analysis()
+    assert isinstance(fig, Figure)
+    assert isinstance(axes, np.ndarray)
+    assert all(isinstance(ax, Axes) for ax in axes.flat)
+
+
+def test_plot_sensitivity_analysis_marginal(mock_suite_with_sensitivity):
+    fig, axes = mock_suite_with_sensitivity.plot_sensitivity_analysis(marginal=True)
+    assert isinstance(fig, Figure)
+    assert isinstance(axes, np.ndarray)
+
+
+def test_plot_sensitivity_analysis_percentage(mock_suite_with_sensitivity):
+    fig, axes = mock_suite_with_sensitivity.plot_sensitivity_analysis(percentage=True)
+    assert isinstance(fig, Figure)
+    assert isinstance(axes, np.ndarray)
+
+
+def test_plot_sensitivity_analysis_error_on_both_modes(mock_suite_with_sensitivity):
+    with pytest.raises(
+        ValueError, match="Not implemented marginal effects in percentage scale."
+    ):
+        mock_suite_with_sensitivity.plot_sensitivity_analysis(
+            marginal=True, percentage=True
+        )
+
+
+def test_plot_sensitivity_analysis_error_on_missing_results(mock_idata):
+    suite = MMMPlotSuite(idata=mock_idata)
+    with pytest.raises(ValueError, match="No sensitivity analysis results found"):
+        suite.plot_sensitivity_analysis()
