@@ -25,9 +25,9 @@ from pymc_extras.prior import Prior
 from pytensor.tensor.basic import TensorVariable
 from scipy.optimize import OptimizeResult
 
-from pymc_marketing.mmm import GeometricAdstock, LogisticSaturation
+from pymc_marketing.mmm import GeometricAdstock, LogisticSaturation, SoftPlusHSGP
 from pymc_marketing.mmm.additive_effect import EventAdditiveEffect, LinearTrendEffect
-from pymc_marketing.mmm.events import EventEffect, GaussianBasis
+from pymc_marketing.mmm.events import EventEffect, GaussianBasis, HalfGaussianBasis
 from pymc_marketing.mmm.lift_test import _swap_columns_and_last_index_level
 from pymc_marketing.mmm.linear_trend import LinearTrend
 from pymc_marketing.mmm.multidimensional import (
@@ -38,19 +38,24 @@ from pymc_marketing.mmm.scaling import Scaling, VariableScaling
 
 
 @pytest.fixture
-def mmm():
+def target_column():
+    return "y_named"
+
+
+@pytest.fixture
+def mmm(target_column):
     return MMM(
         date_column="date",
         channel_columns=["C1", "C2"],
         dims=("country",),
-        target_column="y",
+        target_column=target_column,
         adstock=GeometricAdstock(l_max=10),
         saturation=LogisticSaturation(),
     )
 
 
 @pytest.fixture
-def df() -> pd.DataFrame:
+def df(target_column) -> pd.DataFrame:
     dates = pd.date_range("2025-01-01", periods=3, freq="W-MON").rename("date")
     df = pd.DataFrame(
         {
@@ -65,8 +70,8 @@ def df() -> pd.DataFrame:
 
     y = pd.DataFrame(
         {
-            ("A", "y"): [1, 2, 3],
-            ("B", "y"): [4, 5, 6],
+            ("A", target_column): [1, 2, 3],
+            ("B", target_column): [4, 5, 6],
         },
         index=dates,
     )
@@ -82,9 +87,9 @@ def df() -> pd.DataFrame:
 
 
 @pytest.fixture
-def fit_mmm(df, mmm, mock_pymc_sample):
-    X = df.drop(columns=["y"])
-    y = df["y"]
+def fit_mmm(df, mmm, target_column, mock_pymc_sample):
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
 
     mmm.fit(X, y)
 
@@ -96,9 +101,9 @@ def test_simple_fit(fit_mmm):
     assert isinstance(fit_mmm.idata.constant_data, xr.Dataset)
 
 
-def test_sample_prior_predictive(mmm: MMM, df: pd.DataFrame):
-    X = df.drop(columns=["y"])
-    y = df["y"]
+def test_sample_prior_predictive(mmm: MMM, target_column, df: pd.DataFrame):
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
     mmm.sample_prior_predictive(X, y)
 
     assert isinstance(mmm.prior, xr.Dataset)
@@ -186,7 +191,7 @@ def multi_dim_data():
     "fixture_name, dims",
     [
         pytest.param("single_dim_data", (), id="Marginal model"),
-        pytest.param("multi_dim_data", ("country",), id="County model"),
+        pytest.param("multi_dim_data", ("country",), id="Country model"),
     ],
 )
 @pytest.mark.parametrize(
@@ -265,7 +270,7 @@ def test_fit(
     if time_varying_intercept:
         assert "intercept_latent_process" in var_names
     if time_varying_media:
-        assert "media_latent_process" in var_names
+        assert "media_temporal_latent_multiplier" in var_names
     if yearly_seasonality is not None:
         assert "fourier_contribution" in var_names
 
@@ -285,6 +290,18 @@ def test_fit(
         assert dim in mmm.idata.posterior.dims, (
             f"Extra dimension '{dim}' should be in posterior dims."
         )
+
+    # Check presence of fit_data group
+    assert hasattr(mmm.idata, "fit_data"), "InferenceData should have a fit_data group."
+
+    np.testing.assert_equal(
+        mmm.idata.fit_data.coords["date"].values, mmm.model.coords["date"]
+    )
+    if mmm.dims:
+        for dim in mmm.dims:
+            np.testing.assert_equal(
+                mmm.idata.fit_data.coords[dim].values, mmm.model.coords[dim]
+            )
 
 
 def test_sample_posterior_predictive_new_data(single_dim_data, mock_pymc_sample):
@@ -501,6 +518,225 @@ def test_sample_posterior_predictive_partial_overlap_with_include_last_observati
         )
 
 
+@pytest.mark.parametrize(
+    "hsgp_dims",
+    [
+        pytest.param(("date",), id="hsgp-dims=date"),
+        pytest.param(("date", "channel"), id="hsgp-dims=date,channel"),
+    ],
+)
+def test_time_varying_media_with_custom_hsgp_single_dim(single_dim_data, hsgp_dims):
+    """Ensure passing an HSGP instance to time_varying_media works (single-dim)."""
+    X, y = single_dim_data
+
+    # Build HSGP using the new API
+    hsgp = SoftPlusHSGP.parameterize_from_data(
+        X=np.arange(X.shape[0]),
+        dims=hsgp_dims,
+    )
+
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2", "channel_3"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        time_varying_media=hsgp,
+    )
+
+    mmm.build_model(X, y)
+
+    # Check latent multiplier exists with the expected dims
+    var_name = "media_temporal_latent_multiplier"
+    assert var_name in mmm.model.named_vars
+    latent_dims = mmm.model.named_vars_to_dims[var_name]
+    assert latent_dims == hsgp_dims
+
+    # Channel contribution should always be date x channel
+    assert mmm.model.named_vars_to_dims["channel_contribution"] == ("date", "channel")
+
+
+@pytest.mark.parametrize(
+    "hsgp_dims",
+    [
+        pytest.param(("date",), id="hsgp-dims=date"),
+    ],
+)
+def test_time_varying_intercept_with_custom_hsgp_single_dim(single_dim_data, hsgp_dims):
+    """Ensure passing an HSGP instance to time_varying_intercept works (single/multi-dim)."""
+    X, y = single_dim_data
+
+    hsgp = SoftPlusHSGP.parameterize_from_data(
+        X=np.arange(X.shape[0]),
+        dims=hsgp_dims,
+    )
+
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2", "channel_3"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        time_varying_intercept=hsgp,
+    )
+
+    mmm.build_model(X, y)
+
+    var_name = "intercept_latent_process"
+    assert var_name in mmm.model.named_vars
+    latent_dims = mmm.model.named_vars_to_dims[var_name]
+    assert latent_dims == hsgp_dims
+
+
+@pytest.mark.parametrize(
+    "cov_func",
+    ["expquad", "matern32", "matern52"],
+    ids=["expquad", "matern32", "matern52"],
+)
+def test_time_varying_media_with_custom_hsgp_single_dim_kernels(
+    single_dim_data, cov_func
+) -> None:
+    """Ensure MMM builds when HSGP uses different kernels for media TVP (single-dim)."""
+    X, y = single_dim_data
+
+    hsgp = SoftPlusHSGP.parameterize_from_data(
+        X=np.arange(X.shape[0]),
+        dims=("date", "channel"),
+        cov_func=cov_func,
+    )
+
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2", "channel_3"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        time_varying_media=hsgp,
+    )
+
+    mmm.build_model(X, y)
+
+    var_name = "media_temporal_latent_multiplier"
+    assert var_name in mmm.model.named_vars
+    assert mmm.model.named_vars_to_dims[var_name] == ("date", "channel")
+    # channel contribution dims are stable
+    assert mmm.model.named_vars_to_dims["channel_contribution"] == ("date", "channel")
+
+
+@pytest.mark.parametrize(
+    "cov_func",
+    ["expquad", "matern32", "matern52"],
+    ids=["expquad", "matern32", "matern52"],
+)
+def test_time_varying_intercept_with_custom_hsgp_single_dim_kernels(
+    single_dim_data, cov_func
+) -> None:
+    """Ensure MMM builds when HSGP uses different kernels for intercept TVP (single-dim)."""
+    X, y = single_dim_data
+
+    hsgp = SoftPlusHSGP.parameterize_from_data(
+        X=np.arange(X.shape[0]),
+        dims=("date",),
+        cov_func=cov_func,
+    )
+
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2", "channel_3"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        time_varying_intercept=hsgp,
+    )
+
+    mmm.build_model(X, y)
+
+    var_name = "intercept_latent_process"
+    assert var_name in mmm.model.named_vars
+    assert mmm.model.named_vars_to_dims[var_name] == ("date",)
+
+
+@pytest.mark.parametrize(
+    "hsgp_dims",
+    [
+        pytest.param(("date", "country"), id="hsgp-dims=date,country"),
+        pytest.param(
+            ("date", "country", "channel"), id="hsgp-dims=date,country,channel"
+        ),
+    ],
+)
+def test_time_varying_media_with_custom_hsgp_multi_dim(df, target_column, hsgp_dims):
+    """Ensure passing an HSGP instance to time_varying_media works (multi-dim)."""
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    hsgp = SoftPlusHSGP.parameterize_from_data(
+        X=np.arange(X.shape[0]),
+        dims=hsgp_dims,
+    )
+
+    mmm = MMM(
+        date_column="date",
+        channel_columns=["C1", "C2"],
+        target_column=target_column,
+        dims=("country",),
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        time_varying_media=hsgp,
+    )
+
+    mmm.build_model(X, y)
+
+    var_name = "media_temporal_latent_multiplier"
+    assert var_name in mmm.model.named_vars
+    latent_dims = mmm.model.named_vars_to_dims[var_name]
+    assert latent_dims == hsgp_dims
+
+    # Channel contribution should always be date x country x channel
+    assert mmm.model.named_vars_to_dims["channel_contribution"] == (
+        "date",
+        "country",
+        "channel",
+    )
+
+
+@pytest.mark.parametrize(
+    "hsgp_dims",
+    [
+        pytest.param(("date", "country"), id="hsgp-dims=date,country"),
+        pytest.param(("date",), id="hsgp-dims=date"),
+    ],
+)
+def test_time_varying_intercept_with_custom_hsgp_multi_dim(
+    df, target_column, hsgp_dims
+):
+    """Ensure passing an HSGP instance to time_varying_intercept works (multi-dim)."""
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    hsgp = SoftPlusHSGP.parameterize_from_data(
+        X=np.arange(X.shape[0]),
+        dims=hsgp_dims,
+    )
+
+    mmm = MMM(
+        date_column="date",
+        channel_columns=["C1", "C2"],
+        target_column=target_column,
+        dims=("country",),
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        time_varying_intercept=hsgp,
+    )
+
+    mmm.build_model(X, y)
+
+    var_name = "intercept_latent_process"
+    assert var_name in mmm.model.named_vars
+    latent_dims = mmm.model.named_vars_to_dims[var_name]
+    assert latent_dims == hsgp_dims
+
+
 def test_sample_posterior_predictive_no_overlap_with_include_last_observations(
     single_dim_data, mock_pymc_sample
 ):
@@ -636,6 +872,7 @@ def test_mmm_with_events(
     create_event_effect,
     mmm,
     df,
+    target_column,
     mock_pymc_sample,
 ) -> None:
     mmm.add_events(
@@ -652,8 +889,8 @@ def test_mmm_with_events(
     )
     assert len(mmm.mu_effects) == 2
 
-    X = df.drop(columns=["y"])
-    y = df["y"]
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
     mmm.build_model(X, y)
 
     seed = sum(map(ord, "Adding events"))
@@ -692,6 +929,49 @@ def test_mmm_with_events(
     )
 
     assert less_effect_for_out_of_sample.to_pandas().all()
+
+
+@pytest.mark.parametrize(
+    "basis_factory, expected_zero",
+    [
+        pytest.param(lambda: GaussianBasis(), False, id="gaussian"),
+        pytest.param(
+            lambda: HalfGaussianBasis(mode="after", include_event=True),
+            False,
+            id="halfgaussian-after",
+        ),
+        pytest.param(
+            lambda: HalfGaussianBasis(mode="before", include_event=True),
+            True,
+            id="halfgaussian-before",
+        ),
+    ],
+)
+def test_mmm_with_events_bases(
+    df_events, mmm, df, basis_factory, expected_zero, target_column
+):
+    basis = basis_factory()
+    effect = EventEffect(basis=basis, effect_size=Prior("Normal"), dims=("holiday",))
+
+    mmm.add_events(
+        df_events=df_events,
+        prefix="holiday",
+        effect=effect,
+    )
+
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    mmm.build_model(X, y)
+    mmm.sample_prior_predictive(X, y)  # type: ignore
+
+    da = mmm.prior["holiday_total_effect"]
+    assert "date" in da.dims
+
+    if expected_zero:
+        np.testing.assert_allclose(da, 0)
+    else:
+        assert np.any(np.abs(da.values) > 0)
 
 
 @pytest.mark.parametrize(
@@ -2300,3 +2580,185 @@ def test_specify_time_varying_configuration(
         mmm.model[expected_rv["name"]].owner.op.__class__.__name__
         == expected_rv["kind"]
     )
+
+
+def test_multidimensional_mmm_serializes_and_deserializes_dag_and_nodes(
+    single_dim_data, mock_pymc_sample
+):
+    dag = """
+    digraph {
+        channel_1 -> y;
+        control_1 -> channel_1;
+        control_1 -> y;
+    }
+    """
+    treatment_nodes = ["channel_1"]
+    outcome_node = "y"
+
+    X, y = single_dim_data
+    y = y.rename("y")
+
+    mmm = MMM(
+        date_column="date",
+        target_column="y",
+        channel_columns=["channel_1", "channel_2"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        dag=dag,
+        treatment_nodes=treatment_nodes,
+        outcome_node=outcome_node,
+    )
+
+    mmm.fit(X=X, y=y)
+
+    mmm.save("test_model_multi")
+    loaded_mmm = MMM.load("test_model_multi")
+
+    assert loaded_mmm.dag == dag
+    assert loaded_mmm.treatment_nodes == treatment_nodes
+    assert loaded_mmm.outcome_node == outcome_node
+
+
+def test_multidimensional_mmm_causal_attributes_initialization():
+    dag = """
+    digraph {
+        channel_1 -> target;
+        control_1 -> channel_1;
+        control_1 -> target;
+    }
+    """
+    treatment_nodes = ["channel_1"]
+    outcome_node = "target"
+
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2"],
+        control_columns=["control_1", "control_2"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        dag=dag,
+        treatment_nodes=treatment_nodes,
+        outcome_node=outcome_node,
+    )
+
+    assert mmm.dag == dag
+    assert mmm.treatment_nodes == treatment_nodes
+    assert mmm.outcome_node == outcome_node
+
+
+def test_multidimensional_mmm_causal_attributes_default_treatment_nodes():
+    dag = """
+    digraph {
+        channel_1 -> target;
+        channel_2 -> target;
+        control_1 -> channel_1;
+        control_1 -> target;
+    }
+    """
+    outcome_node = "target"
+
+    with pytest.warns(
+        UserWarning, match="No treatment nodes provided, using channel columns"
+    ):
+        mmm = MMM(
+            date_column="date",
+            target_column="target",
+            channel_columns=["channel_1", "channel_2"],
+            control_columns=["control_1", "control_2"],
+            adstock=GeometricAdstock(l_max=2),
+            saturation=LogisticSaturation(),
+            dag=dag,
+            outcome_node=outcome_node,
+        )
+
+    assert mmm.treatment_nodes == ["channel_1", "channel_2"]
+    assert mmm.outcome_node == "target"
+
+
+def test_multidimensional_mmm_adjustment_set_updates_control_columns():
+    dag = """
+    digraph {
+        channel_1 -> target;
+        control_1 -> channel_1;
+        control_1 -> target;
+    }
+    """
+    treatment_nodes = ["channel_1"]
+    outcome_node = "target"
+
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2"],
+        control_columns=["control_1", "control_2"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        dag=dag,
+        treatment_nodes=treatment_nodes,
+        outcome_node=outcome_node,
+    )
+
+    assert mmm.control_columns == ["control_1"]
+
+
+def test_multidimensional_mmm_missing_dag_does_not_initialize_causal_graph():
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+    )
+
+    assert mmm.dag is None
+    assert not hasattr(mmm, "causal_graphical_model")
+
+
+def test_multidimensional_mmm_only_dag_provided_does_not_initialize_graph():
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2"],
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        dag="digraph {channel_1 -> target;}",
+    )
+
+    assert mmm.treatment_nodes is None
+    assert mmm.outcome_node is None
+    assert not hasattr(mmm, "causal_graphical_model")
+
+
+def test_default_model_config_dims_include_self_dims():
+    mmm = MMM(
+        date_column="date",
+        target_column="target",
+        channel_columns=["channel_1", "channel_2"],
+        dims=("country",),
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+    )
+
+    cfg = mmm.default_model_config
+
+    # Keys from MMM.default_model_config we want to validate here
+    keys_to_check = [
+        "intercept",
+        "likelihood",
+        "gamma_control",
+        "gamma_fourier",
+    ]
+
+    for key in keys_to_check:
+        assert key in cfg, f"{key} missing in default_model_config"
+        prior = cfg[key]
+
+        # Prior may be a distribution or a container (e.g., likelihood with nested sigma prior)
+        # In both cases, the top-level prior should expose dims that at least include model dims
+        assert hasattr(prior, "dims"), f"{key} prior does not have dims attribute"
+
+        dims = prior.dims if isinstance(prior.dims, tuple) else (prior.dims,)
+        # Ensure all model dims are present (allowing additional dims like control/fourier_mode)
+        for d in mmm.dims:
+            assert d in dims, f"{key} dims {dims} must include model dims {mmm.dims}"
