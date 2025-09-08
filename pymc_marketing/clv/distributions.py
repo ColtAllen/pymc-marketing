@@ -1228,6 +1228,16 @@ class ShiftedBetaGeometric(Discrete):
             msg="alpha > 0, beta > 0",
         )
 
+    # TODO: Add a test for this.
+    def logcdf(value, alpha, beta):
+        logS = (
+            pt.gammaln(beta + value)
+            - pt.gammaln(beta)
+            + pt.gammaln(alpha + beta)
+            - pt.gammaln(alpha + beta + value)
+        )
+        return pt.log1mexp(logS)
+
     def support_point(rv, size, alpha, beta):
         """Calculate a reasonable starting point for sampling.
 
