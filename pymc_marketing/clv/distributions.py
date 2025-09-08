@@ -1118,3 +1118,127 @@ def C_t(
     base_sum = pt.sum(pt.shape_padleft(per_time_sum) * mask, axis=-1)
     # If original t was scalar, return scalar (saturate at last time step)
     return pt.squeeze(base_sum)
+
+
+class ShiftedBetaGeometricRV(RandomVariable):
+    name = "sbg"
+    signature = "(),()->()"
+
+    dtype = "int64"
+    _print_name = ("ShiftedBetaGeometric", "\\operatorname{ShiftedBetaGeometric}")
+
+    @classmethod
+    def rng_fn(cls, rng, alpha, beta, size):
+        if size is None:
+            size = np.broadcast_shapes(alpha.shape, beta.shape)
+
+        alpha = np.broadcast_to(alpha, size)
+        beta = np.broadcast_to(beta, size)
+
+        p = rng.beta(a=alpha, b=beta, size=size)
+
+        samples = rng.geometric(p, size=size)
+
+        return samples
+
+
+sbg = ShiftedBetaGeometricRV()
+
+
+class ShiftedBetaGeometric(Discrete):
+    r"""Shifted Beta-Geometric distribution.
+
+    This mixture distribution extends the Geometric distribution to support heterogeneity across observations.
+
+    Hardie and Fader describe this distribution with the following PMF and survival functions in [1]_:
+
+    .. math::
+        \mathbb{P}(T=t|\alpha,\beta) = (\frac{B(\alpha+1,\beta+t-1)}{B(\alpha,\beta}),t=1,2,...  \\
+        \begin{align}
+        \mathbb{S}(t|\alpha,\beta) = (\frac{B(\alpha,\beta+t)}{B(\alpha,\beta}),t=1,2,... \\
+        \end{align}
+
+    .. plot::
+        :context: close-figs
+
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import scipy.stats as st
+        from scipy.special import beta
+        import arviz as az
+
+        plt.style.use('arviz-darkgrid')
+        t = np.arange(1, 11)
+        alpha_vals = [.1, .1, 1, 1]
+        beta_vals = [.5, 1, 1, 4]
+        for alpha, _beta in zip(alpha_vals, beta_vals):
+            pmf = beta(alpha + 1, _beta + t - 1) / beta(alpha, _beta)
+            plt.plot(t, pmf, '-o', label=r'$\alpha$ = {}, $beta$ = {}'.format(alpha, _beta))
+        plt.xlabel('t', fontsize=12)
+        plt.ylabel('p(t)', fontsize=12)
+        plt.legend(loc=1)
+        plt.show()
+
+    ========  ===============================================
+    Support   :math:`t \in \mathbb{N}_{>0}`
+    ========  ===============================================
+
+    Parameters
+    ----------
+    alpha : tensor_like of float
+        Scale parameter (alpha > 0).
+    beta : tensor_like of float
+        Scale parameter (beta > 0).
+
+    References
+    ----------
+    .. [1] Fader, P. S., & Hardie, B. G. (2007). How to project customer retention.
+           Journal of Interactive Marketing, 21(1), 76-90.
+           https://faculty.wharton.upenn.edu/wp-content/uploads/2012/04/Fader_hardie_jim_07.pdf
+    """
+
+    rv_op = sbg
+
+    @classmethod
+    def dist(cls, alpha, beta, *args, **kwargs):
+        alpha = pt.as_tensor_variable(alpha)
+        beta = pt.as_tensor_variable(beta)
+
+        return super().dist([alpha, beta], *args, **kwargs)
+
+    def logp(value, alpha, beta):
+        logp = betaln(alpha + 1, beta + value - 1) - betaln(alpha, beta)
+
+        logp = pt.switch(
+            pt.or_(
+                pt.lt(value, 1),
+                pt.or_(
+                    alpha <= 0,
+                    beta <= 0,
+                ),
+            ),
+            -np.inf,
+            logp,
+        )
+
+        return check_parameters(
+            logp,
+            alpha > 0,
+            beta > 0,
+            msg="alpha > 0, beta > 0",
+        )
+
+    def support_point(rv, size, alpha, beta):
+        """Calculate a reasonable starting point for sampling.
+
+        For the Shifted Beta-Geometric distribution, we use a point estimate based on
+        the expected value of the mixture components.
+        """
+        geo_mean = pt.ceil(
+            pt.reciprocal(
+                alpha / (alpha + beta)  # expected value of the beta distribution
+            )  # expected value of the geometric distribution
+        )
+        if not rv_size_is_none(size):
+            geo_mean = pt.full(size, geo_mean)
+        return geo_mean
