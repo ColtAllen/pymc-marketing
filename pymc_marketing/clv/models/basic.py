@@ -61,8 +61,6 @@ class CLVModel(ModelBuilder):
             non_distributions=non_distributions,
         )
 
-        self.data = data
-
     @staticmethod
     def _validate_cols(
         data: pd.DataFrame,
@@ -93,6 +91,14 @@ class CLVModel(ModelBuilder):
             return self._model_type
         else:
             return f"{self._model_type}\n{self.model.str_repr()}"
+
+    @classmethod
+    def idata_to_init_kwargs(cls, idata: az.InferenceData) -> dict:
+        """Create the initialization kwargs from an InferenceData object."""
+        kwargs = cls.attrs_to_init_kwargs(idata.attrs)
+        kwargs["data"] = idata.fit_data.to_dataframe()
+
+        return kwargs
 
     @classmethod
     def idata_to_init_kwargs(cls, idata: az.InferenceData) -> dict:
@@ -180,3 +186,16 @@ class CLVModel(ModelBuilder):
     @property
     def _serializable_model_config(self) -> dict:
         return self.model_config
+
+    def fit_summary(self, **kwargs):
+        """Compute the summary of the fit result."""
+        res = self.fit_result
+        # Map fitting only gives one value, so we return it. We use arviz
+        # just to get it nicely into a DataFrame
+        if res.chain.size == 1 and res.draw.size == 1:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = az.summary(self.fit_result, **kwargs, kind="stats")
+            return res["mean"].rename("value")
+        else:
+            return az.summary(self.fit_result, **kwargs)
