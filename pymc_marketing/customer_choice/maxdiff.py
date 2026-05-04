@@ -36,7 +36,7 @@ import xarray as xr
 from pymc.util import RandomState
 from pymc_extras.prior import Prior
 
-from pymc_marketing.model_builder import ModelBuilder, create_sample_kwargs
+from pymc_marketing.model_builder import ModelBuilder
 from pymc_marketing.model_config import parse_model_config
 from pymc_marketing.version import __version__
 
@@ -1155,52 +1155,40 @@ class MaxDiffMixedLogit(ModelBuilder):
 
         return prior_pred
 
-    def fit(
+    def fit(  # type: ignore[override]
         self,
         task_df: pd.DataFrame | None = None,
         progressbar: bool | None = None,
         random_seed: RandomState | None = None,
         **kwargs,
     ) -> az.InferenceData:
-        """Fit the model via NUTS and attach the result to ``self.idata``."""
+        """Fit the model and attach the result to ``self.idata``.
+
+        Parameters
+        ----------
+        task_df : pd.DataFrame, optional
+            New MaxDiff task data. If provided, replaces the previously
+            registered ``task_df``.
+        progressbar : bool, optional
+            Show progress bar during sampling.
+        random_seed : RandomState, optional
+            Random seed for reproducibility.
+        **kwargs
+            Forwarded to :meth:`ModelFitter.fit` (e.g. ``method="advi"``) and
+            the underlying sampler.
+        """
         if task_df is not None:
             self.task_df = task_df
 
         if not hasattr(self, "model"):
             self.build_model()
 
-        sampler_kwargs = create_sample_kwargs(
-            self.sampler_config,
-            progressbar,
-            random_seed,
+        return super().fit(
+            self._create_fit_data(),
+            progressbar=progressbar,
+            random_seed=random_seed,
             **kwargs,
         )
-
-        with self.model:
-            idata = pm.sample(**sampler_kwargs)
-
-        if self.idata:
-            self.idata = self.idata.copy()
-            self.idata.extend(idata, join="right")
-        else:
-            self.idata = idata
-
-        self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
-
-        if "fit_data" in self.idata:
-            del self.idata.fit_data
-
-        fit_data = self._create_fit_data()
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            self.idata.add_groups(fit_data=fit_data)
-
-        self.set_idata_attrs(self.idata)
-        return self.idata
 
     def sample_posterior_predictive(
         self,

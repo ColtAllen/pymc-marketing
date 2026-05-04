@@ -214,6 +214,22 @@ class TestCLVModel:
         ):
             model.fit(fit_method="mcmc")
 
+    def test_fit_extends_idata_and_tags_version(self, mocker):
+        """CLV fit() inherits regression behaviour: posterior version tag + idata.extend."""
+        from pymc_marketing.version import __version__
+
+        model = CLVModelTest()
+        mocker.patch("pymc.sample", mock_sample)
+        idata = model.fit(tune=0, chains=2, draws=5)
+
+        assert idata.posterior.attrs.get("pymc_marketing_version") == __version__
+        first_idata = model.idata
+
+        model.fit(tune=0, chains=2, draws=5)
+        # Second fit must produce a *new* idata (extend path) rather than mutate in place.
+        assert model.idata is not first_idata
+        assert model.idata.posterior.attrs.get("pymc_marketing_version") == __version__
+
     def test_load(self, mocker):
         model = CLVModelTest()
 

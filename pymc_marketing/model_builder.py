@@ -20,13 +20,16 @@ from abc import ABC, abstractmethod
 from functools import wraps
 from inspect import signature
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
 import xarray as xr
+from pymc.backends import NDArray
+from pymc.backends.base import MultiTrace
+from pymc.model.core import Model
 from pymc.util import RandomState
 from pymc_extras.printing import model_table
 from rich.table import Table
@@ -588,7 +591,311 @@ class ModelIO:
         return model
 
 
-class ModelBuilder(ABC, ModelIO):
+class ModelFitter:
+    """Mixin providing the consolidated fit pipeline for PyMC-Marketing models.
+
+    The mixin is composed into :class:`ModelBuilder` and supplies a single
+    ``fit`` entry point that dispatches to the requested inference algorithm
+    (``mcmc``, ``map``, ``demz``, ``advi``, ``fullrank_advi``). Subclasses
+    that need to translate a custom data API (e.g. ``X, y`` or ``choice_df``)
+    override ``fit`` as a thin wrapper that prepares an :class:`xarray.Dataset`
+    and calls ``super().fit(...)``.
+
+    Subclasses must provide the following attributes (typically inherited from
+    :class:`ModelBuilder` and :class:`ModelIO`):
+
+    - ``self.model``: a :class:`pymc.Model` populated by ``build_model``.
+    - ``self.idata``: ``arviz.InferenceData | None`` storing fit results.
+    - ``self.sampler_config``: ``dict[str, Any]`` of sampler defaults.
+    - ``self.build_model``: callable used to construct the model.
+    - ``self.set_idata_attrs``: from :class:`ModelIO`.
+    """
+
+    model: pm.Model
+    idata: az.InferenceData | None
+    sampler_config: dict[str, Any]
+
+    def fit(
+        self,
+        data: pd.DataFrame | xr.Dataset | None = None,
+        method: Literal["mcmc", "map", "demz", "advi", "fullrank_advi"] = "mcmc",
+        progressbar: bool | None = None,
+        random_seed: RandomState | None = None,
+        fit_method: str | None = None,
+        **kwargs: Any,
+    ) -> az.InferenceData:
+        """Fit the model using the requested inference method.
+
+        Parameters
+        ----------
+        data : pd.DataFrame or xr.Dataset, optional
+            Training data. When provided and the model has not yet been built,
+            it is forwarded to :meth:`build_model`. The dataset is also stored
+            in the ``fit_data`` group of the resulting :class:`InferenceData`
+            so the model can be reconstructed from disk.
+        method : {"mcmc", "map", "demz", "advi", "fullrank_advi"}, default "mcmc"
+            Inference algorithm.
+
+            * ``"mcmc"``: NUTS via :func:`pymc.sample` (deterministics are
+              computed post-hoc to keep the sampler trace small).
+            * ``"map"``: Maximum a posteriori via :func:`pymc.find_MAP`.
+            * ``"demz"``: Gradient-free DEMetropolisZ sampler.
+            * ``"advi"`` / ``"fullrank_advi"``: Variational inference via
+              :func:`pymc.fit` followed by ``Approximation.sample``.
+        progressbar : bool, optional
+            Show a progressbar during sampling.
+        random_seed : RandomState, optional
+            Seed forwarded to the sampler for reproducibility.
+        fit_method : str, optional
+            Deprecated alias for ``method`` retained for backward compatibility.
+        **kwargs : Any
+            Additional keyword arguments forwarded to the underlying sampler.
+
+        Returns
+        -------
+        az.InferenceData
+            Inference data produced by the fit. Also assigned to ``self.idata``.
+        """
+        if fit_method is not None:
+            warnings.warn(
+                "'fit_method' is deprecated and will be removed in version 1.0. "
+                "Use 'method' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            method = fit_method  # type: ignore[assignment]
+
+        if not hasattr(self, "model"):
+            if data is not None:
+                self.build_model(data)  # type: ignore[attr-defined, call-arg]
+            elif getattr(self, "data", None) is not None:
+                self.build_model(self.data)  # type: ignore[attr-defined, call-arg]
+            else:
+                raise ValueError(
+                    "Data must be provided either to fit(data=...) or "
+                    "model must be built with build_model(data=...) first."
+                )
+
+        approx = None
+        match method:
+            case "mcmc":
+                idata = self._fit_mcmc(
+                    progressbar=progressbar,
+                    random_seed=random_seed,
+                    **kwargs,
+                )
+            case "map":
+                idata = self._fit_MAP(**kwargs)
+            case "demz":
+                idata = self._fit_DEMZ(
+                    progressbar=progressbar,
+                    random_seed=random_seed,
+                    **kwargs,
+                )
+            case "advi":
+                approx, idata = self._fit_approx(
+                    method="advi",
+                    progressbar=progressbar,
+                    random_seed=random_seed,
+                    **kwargs,
+                )
+            case "fullrank_advi":
+                approx, idata = self._fit_approx(
+                    method="fullrank_advi",
+                    progressbar=progressbar,
+                    random_seed=random_seed,
+                    **kwargs,
+                )
+            case _:
+                raise ValueError(
+                    "Fit method options are "
+                    "['mcmc', 'map', 'demz', 'advi', 'fullrank_advi'], "
+                    f"got: {method}"
+                )
+
+        if self.idata:
+            self.idata = self.idata.copy()
+            self.idata.extend(idata, join="right")
+        else:
+            self.idata = idata
+
+        if "posterior" in self.idata:
+            self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
+
+        self.post_sample_model_transformation()
+
+        if approx is not None:
+            self.approx = approx
+
+        fit_data_source: pd.DataFrame | xr.Dataset | None
+        if data is not None:
+            fit_data_source = data
+        elif getattr(self, "data", None) is not None:
+            fit_data_source = self.data  # type: ignore[attr-defined]
+        else:
+            fit_data_source = None
+
+        if fit_data_source is not None:
+            self._set_fit_data_group(fit_data_source)
+
+        self.set_idata_attrs(self.idata)  # type: ignore[attr-defined]
+        return self.idata
+
+    def _fit_mcmc(
+        self,
+        progressbar: bool | None = None,
+        random_seed: RandomState | None = None,
+        **kwargs: Any,
+    ) -> az.InferenceData:
+        """Sample the posterior with NUTS and merge deterministics afterwards."""
+        sampler_kwargs = create_sample_kwargs(
+            self.sampler_config,
+            progressbar,
+            random_seed,
+            **kwargs,
+        )
+        var_names = [var.name for var in self.model.free_RVs]
+        with self.model:
+            idata = pm.sample(var_names=var_names, **sampler_kwargs)
+            idata.posterior = pm.compute_deterministics(
+                idata.posterior, merge_dataset=True
+            )
+        return idata
+
+    def _fit_MAP(self, **kwargs: Any) -> az.InferenceData:
+        """Find the model maximum a posteriori via :func:`pymc.find_MAP`."""
+        model = self.model
+        map_res = pm.find_MAP(model=model, **kwargs)
+        value_vars_names = {v.name for v in cast(Model, model).value_vars}
+        map_res = {k: v for k, v in map_res.items() if k in value_vars_names}
+        map_strace = NDArray(model=model)
+        map_strace.setup(draws=1, chain=0)
+        try:
+            map_strace.record(map_res, in_warmup=False)
+        except TypeError:
+            map_strace.record(map_res)
+        map_strace.close()
+        trace = MultiTrace([map_strace])
+        return pm.to_inference_data(trace, model=model)
+
+    def _fit_DEMZ(
+        self,
+        progressbar: bool | None = None,
+        random_seed: RandomState | None = None,
+        **kwargs: Any,
+    ) -> az.InferenceData:
+        """Sample with the gradient-free DEMetropolisZ sampler."""
+        sampler_kwargs = create_sample_kwargs(
+            self.sampler_config,
+            progressbar,
+            random_seed,
+            **kwargs,
+        )
+        with self.model:
+            return pm.sample(step=pm.DEMetropolisZ(), **sampler_kwargs)
+
+    def _fit_approx(
+        self,
+        method: Literal["advi", "fullrank_advi"] = "advi",
+        progressbar: bool | None = None,
+        random_seed: RandomState | None = None,
+        **kwargs: Any,
+    ) -> tuple[Any, az.InferenceData]:
+        """Run variational inference via :func:`pymc.fit` and sample from it."""
+        sampler_config: dict[str, Any] = (
+            {} if self.sampler_config is None else self.sampler_config.copy()
+        )
+        sampler_config = {**sampler_config, **kwargs}
+        if progressbar is not None:
+            sampler_config["progressbar"] = progressbar
+        if random_seed is not None:
+            sampler_config["random_seed"] = random_seed
+
+        if sampler_config.get("method") is not None:
+            raise ValueError(
+                "The 'method' parameter is set in sampler_config. "
+                "Cannot be called with 'advi'."
+            )
+
+        if sampler_config.get("chains", 1) > 1:
+            warnings.warn(
+                "The 'chains' parameter must be 1 with 'advi'. "
+                "Sampling only 1 chain despite the provided parameter.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        with self.model:
+            approx = pm.fit(
+                method=method,
+                callbacks=[pm.callbacks.CheckParametersConvergence(diff="absolute")],
+                **{
+                    k: v
+                    for k, v in sampler_config.items()
+                    if k
+                    in [
+                        "n",
+                        "random_seed",
+                        "inf_kwargs",
+                        "start",
+                        "start_sigma",
+                        "score",
+                        "callbacks",
+                        "progressbar",
+                        "progressbar_theme",
+                        "obj_n_mc",
+                        "tf_n_mc",
+                        "obj_optimizer",
+                        "test_optimizer",
+                        "more_obj_params",
+                        "more_tf_params",
+                        "more_updates",
+                        "total_grad_norm_constraint",
+                        "fn_kwargs",
+                        "more_replacements",
+                    ]
+                },
+            )
+            idata = approx.sample(
+                **{
+                    k: v
+                    for k, v in sampler_config.items()
+                    if k in ["draws", "random_seed", "return_inferencedata"]
+                }
+            )
+        return approx, idata
+
+    def post_sample_model_transformation(self) -> None:
+        """Run subclass-specific post-processing after sampling.
+
+        Default implementation is a no-op. Subclasses can override this to
+        adjust the model state once ``self.idata`` has been populated.
+        """
+
+    def _set_fit_data_group(self, data: pd.DataFrame | xr.Dataset) -> None:
+        """Replace the ``fit_data`` group on ``self.idata`` with ``data``.
+
+        Accepts either a :class:`pandas.DataFrame` (converted via ``to_xarray``)
+        or an :class:`xarray.Dataset`.
+        """
+        if self.idata is None:
+            return
+
+        if "fit_data" in self.idata:
+            del self.idata.fit_data
+
+        fit_data = data.to_xarray() if isinstance(data, pd.DataFrame) else data
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message="The group fit_data is not defined in the InferenceData scheme",
+            )
+            self.idata.add_groups(fit_data=fit_data)
+
+
+class ModelBuilder(ABC, ModelIO, ModelFitter):
     """Base class for building PyMC-Marketing models.
 
     Child classes must implement the following methods:
@@ -596,9 +903,12 @@ class ModelBuilder(ABC, ModelIO):
     - default_sampler_config: Returns a dictionary for default sampler configuration.
     - build_model: Builds the model based on the provided data and model configuration.
     - build_from_idata: Builds the model from an InferenceData object. Needed for loading models.
-    - fit: Fits the model based on the provided data and sampler configurations.
     - attrs_to_init_kwargs: Override to add additional init keyword arguments.
     - _serializable_model_config: Needed for saving and loading the model.
+
+    Inherits ``fit`` and the per-method helpers (``_fit_mcmc``, ``_fit_MAP``,
+    ``_fit_DEMZ``, ``_fit_approx``) from :class:`ModelFitter`. Subclasses
+    typically only override ``fit`` to provide a custom data API.
 
     """
 
@@ -729,23 +1039,6 @@ class ModelBuilder(ABC, ModelIO):
         Returns
         -------
         None
-
-        """
-
-    # TODO: Convert from abstract method into a base fitter for all models.
-    @abstractmethod
-    def fit(
-        self,
-        **kwargs,
-    ) -> az.InferenceData:
-        """Fit a model using the data passed as a parameter.
-
-        Sets attrs to inference data of the model.
-
-        Returns
-        -------
-        self : az.InferenceData
-            Returns inference data of the fitted model.
 
         """
 
@@ -976,10 +1269,6 @@ class RegressionModelBuilder(ModelBuilder):
 
         return xr.merge([X, y])
 
-    def post_sample_model_transformation(self) -> None:
-        """Perform transformation on the model after sampling."""
-        pass
-
     def fit(  # type: ignore[override]
         self,
         X: pd.DataFrame | xr.Dataset | xr.DataArray,
@@ -1004,6 +1293,8 @@ class RegressionModelBuilder(ModelBuilder):
             Provides sampler with initial random seed for obtaining reproducible samples.
         **kwargs : Any
             Custom sampler settings can be provided in form of keyword arguments.
+            ``method`` is forwarded to :meth:`ModelFitter.fit` and selects the
+            inference algorithm (``"mcmc"`` by default).
 
         Returns
         -------
@@ -1030,6 +1321,9 @@ class RegressionModelBuilder(ModelBuilder):
         if y is None:
             y = np.zeros(X.shape[0])
 
+        if isinstance(y, np.ndarray):
+            y = pd.Series(y, index=X.index, name=self.output_var)
+
         if self.output_var in X:
             raise ValueError(
                 f"X includes a column named '{self.output_var}', which conflicts with the target variable."
@@ -1038,46 +1332,14 @@ class RegressionModelBuilder(ModelBuilder):
         if not hasattr(self, "model"):
             self.build_model(X, y)
 
-        sampler_kwargs = create_sample_kwargs(
-            self.sampler_config,
-            progressbar,
-            random_seed,
-            **kwargs,
-        )
-
-        # Sample without deterministics first
-        var_names = [var.name for var in self.model.free_RVs]
-        with self.model:
-            idata = pm.sample(var_names=var_names, **sampler_kwargs)
-
-        # Compute deterministics after sampling
-        with self.model:
-            idata.posterior = pm.compute_deterministics(
-                idata.posterior, merge_dataset=True
-            )
-
-        if self.idata:
-            self.idata = self.idata.copy()
-            self.idata.extend(idata, join="right")
-        else:
-            self.idata = idata
-
-        self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
-
-        if "fit_data" in self.idata:
-            del self.idata.fit_data
-
         fit_data = self.create_fit_data(X, y)
 
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            self.idata.add_groups(fit_data=fit_data)
-        self.set_idata_attrs(self.idata)
-        return self.idata  # type: ignore
+        return super().fit(
+            fit_data,
+            progressbar=progressbar,
+            random_seed=random_seed,
+            **kwargs,
+        )
 
     def predict(
         self,
@@ -1141,107 +1403,60 @@ class RegressionModelBuilder(ModelBuilder):
         fit_kwargs: dict[str, Any] | None = None,
         sample_kwargs: dict[str, Any] | None = None,
     ) -> az.InferenceData:
-        """Fit a model using Variational Inference and return InferenceData.
+        """Fit the model with Variational Inference (deprecated alias).
 
-        This performs variational inference via `pymc.fit`, then draws posterior samples
-        from the fitted approximation via `Approximation.sample`, returning an
-        `arviz.InferenceData` compatible with the rest of the API (same structure as `.fit`).
+        .. deprecated::
+            ``approximate_fit`` is kept as a thin compatibility shim. Use
+            ``fit(..., method="advi")`` (or ``method="fullrank_advi"``) instead.
+            ``fit_kwargs`` and ``sample_kwargs`` are merged and forwarded to
+            the unified VI path.
 
         Parameters
         ----------
         X : array-like | array, shape (n_obs, n_features)
-            The training input samples. If scikit-learn is available, array-like, otherwise array.
+            The training input samples.
         y : array-like | array, shape (n_obs,)
-            The target values (real numbers). If scikit-learn is available, array-like, otherwise array.
+            The target values.
         progressbar : bool, optional
-            Specifies whether the fitting/sample progress bar should be displayed. Defaults to True.
-        random_seed : Optional[RandomState]
-            Provides stochastic procedures with initial random seed for reproducibility.
+            Show a progressbar during sampling.
+        random_seed : RandomState, optional
+            Random seed for reproducibility.
         fit_kwargs : dict, optional
-            Extra keyword arguments forwarded to `pymc.fit` (e.g., {"n": 10_000, "method": "advi"}).
+            Extra keyword arguments forwarded to :func:`pymc.fit`.
         sample_kwargs : dict, optional
-            Extra keyword arguments forwarded to `Approximation.sample` (e.g., {"draws": 1_000}).
+            Extra keyword arguments forwarded to ``Approximation.sample``.
 
         Returns
         -------
         az.InferenceData
             Inference data of the variationally fitted model.
         """
-        if (
-            isinstance(y, pd.Series)
-            and isinstance(X, pd.DataFrame)
-            and not X.index.equals(y.index)
-        ):
-            raise ValueError("Index of X and y must match.")
+        warnings.warn(
+            "approximate_fit is deprecated; use fit(..., method='advi') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
-        if y is None:
-            y = np.zeros(X.shape[0])
-
-        if self.output_var in X:
+        merged: dict[str, Any] = {}
+        if fit_kwargs:
+            merged.update(fit_kwargs)
+        if sample_kwargs:
+            merged.update(sample_kwargs)
+        method = merged.pop("method", "advi")
+        if method not in ("advi", "fullrank_advi"):
             raise ValueError(
-                f"X includes a column named '{self.output_var}', which conflicts with the target variable."
+                "approximate_fit only supports method in {'advi', 'fullrank_advi'}, "
+                f"got: {method}"
             )
 
-        if not hasattr(self, "model"):
-            self.build_model(X, y)
-
-        # Prepare kwargs for pymc.fit
-        _fit_kwargs: dict[str, Any] = {}
-        if fit_kwargs is not None:
-            _fit_kwargs.update(fit_kwargs)
-        if progressbar is not None:
-            _fit_kwargs["progressbar"] = progressbar
-        if random_seed is not None:
-            _fit_kwargs["random_seed"] = random_seed
-
-        # Run variational inference and then sample from the approximation
-        with self.model:
-            approximation = pm.fit(**_fit_kwargs)
-
-            _sample_kwargs: dict[str, Any] = {}
-            if sample_kwargs is not None:
-                _sample_kwargs.update(sample_kwargs)
-            # Use sampler_config draws if not explicitly provided
-            _sample_kwargs.setdefault("draws", self.sampler_config.get("draws", 1_000))
-            if random_seed is not None:
-                _sample_kwargs.setdefault("random_seed", random_seed)
-            _sample_kwargs.setdefault("return_inferencedata", True)
-
-            idata: az.InferenceData = approximation.sample(**_sample_kwargs)  # type: ignore[assignment]
-
-        # Compute deterministics after sampling for parity with MCMC `.fit`
-        with self.model:
-            idata.posterior = pm.compute_deterministics(
-                idata.posterior, merge_dataset=True
-            )
-
-        self.post_sample_model_transformation()
-
-        # Extend or set self.idata
-        if self.idata:
-            self.idata = self.idata.copy()
-            self.idata.extend(idata, join="right")
-        else:
-            self.idata = idata
-
-        # Annotate, attach fit_data, and set attrs
-        self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
-
-        if "fit_data" in self.idata:
-            del self.idata.fit_data
-
-        fit_data = self.create_fit_data(X, y)
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            self.idata.add_groups(fit_data=fit_data)
-
-        self.set_idata_attrs(self.idata)
-        return self.idata  # type: ignore
+        return self.fit(
+            X,
+            y,
+            progressbar=progressbar,
+            random_seed=random_seed,
+            method=method,
+            **merged,
+        )
 
     def sample_prior_predictive(
         self,

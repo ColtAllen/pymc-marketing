@@ -14,7 +14,6 @@
 """Mixed Logit for Product Preference Analysis with Random Coefficients."""
 
 import json
-import warnings
 from typing import Self
 
 import arviz as az
@@ -29,7 +28,7 @@ from pymc.util import RandomState
 from pymc_extras.prior import Prior
 from pytensor.tensor.variable import TensorVariable
 
-from pymc_marketing.model_builder import ModelBuilder, create_sample_kwargs
+from pymc_marketing.model_builder import ModelBuilder
 from pymc_marketing.model_config import parse_model_config
 from pymc_marketing.version import __version__
 
@@ -1072,7 +1071,7 @@ class MixedLogit(ModelBuilder):
         df_xr = df_xr.rename({"index": "obs"})
         return df_xr
 
-    def fit(
+    def fit(  # type: ignore[override]
         self,
         choice_df: pd.DataFrame | None = None,
         utility_equations: list[str] | None = None,
@@ -1094,63 +1093,28 @@ class MixedLogit(ModelBuilder):
         random_seed : RandomState, optional
             Random seed for reproducibility
         **kwargs
-            Additional arguments passed to pm.sample()
+            Additional arguments forwarded to :meth:`ModelFitter.fit` and the
+            underlying sampler. ``method`` selects the inference algorithm.
 
         Returns
         -------
         az.InferenceData
             Fitted model with posterior samples
         """
-        # Allow updating data at fit time
         if choice_df is not None:
             self.choice_df = choice_df
         if utility_equations is not None:
             self.utility_equations = utility_equations
 
-        # Build model if not already built
         if not hasattr(self, "model"):
             self.build_model()
 
-        # Configure sampler
-        sampler_kwargs = create_sample_kwargs(
-            self.sampler_config,
-            progressbar,
-            random_seed,
+        return super().fit(
+            self._create_fit_data(),
+            progressbar=progressbar,
+            random_seed=random_seed,
             **kwargs,
         )
-
-        # Sample
-        with self.model:
-            idata = pm.sample(**sampler_kwargs)
-
-        # Store and extend results
-        if self.idata:
-            self.idata = self.idata.copy()
-            self.idata.extend(idata, join="right")
-        else:
-            self.idata = idata
-
-        # Add version metadata
-        self.idata["posterior"].attrs["pymc_marketing_version"] = __version__
-
-        # Add fit_data group
-        if "fit_data" in self.idata:
-            del self.idata.fit_data
-
-        fit_data = self._create_fit_data()
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=UserWarning,
-                message="The group fit_data is not defined in the InferenceData scheme",
-            )
-            self.idata.add_groups(fit_data=fit_data)
-
-        # Set attributes for save/load
-        self.set_idata_attrs(self.idata)
-
-        return self.idata
 
     def build_from_idata(self, idata: az.InferenceData) -> None:
         """

@@ -837,6 +837,43 @@ def test_second_fit(toy_X, toy_y, mock_pymc_sample):
     assert id_before != id_after
 
 
+def test_fit_method_map(toy_X, toy_y) -> None:
+    """RegressionModelBuilder.fit(method='map') should run the MAP branch."""
+    model = RegressionModelBuilderTest(sampler_config={"draws": 1, "chains": 1})
+
+    idata = model.fit(toy_X, toy_y, method="map")
+
+    assert isinstance(idata, az.InferenceData)
+    assert "posterior" in idata
+    assert idata.posterior.sizes["chain"] == 1
+    assert idata.posterior.sizes["draw"] == 1
+    assert "fit_data" in idata
+
+
+def test_approximate_fit_emits_deprecation_warning(toy_X, toy_y) -> None:
+    """approximate_fit must warn and route through fit(method='advi')."""
+    model = RegressionModelBuilderTest(sampler_config={"draws": 20, "chains": 1})
+
+    with pytest.warns(
+        DeprecationWarning,
+        match="approximate_fit is deprecated; use fit",
+    ):
+        idata = model.approximate_fit(
+            toy_X,
+            toy_y,
+            progressbar=False,
+            random_seed=42,
+            fit_kwargs={"n": 200, "method": "advi"},
+            sample_kwargs={"draws": 20},
+        )
+
+    assert idata is not None
+    assert "posterior" in idata.groups()
+    assert idata.posterior.sizes["draw"] == 20
+    assert idata.posterior.sizes["chain"] == 1
+    assert "fit_data" in idata
+
+
 class InsufficientModel(RegressionModelBuilder):
     def __init__(
         self, model_config=None, sampler_config=None, new_parameter=None

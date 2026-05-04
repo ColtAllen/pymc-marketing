@@ -71,7 +71,7 @@ def set_idata(model):
     """Part of basic fit method for CLVModel."""
     model.set_idata_attrs(model.idata)
     if model.data is not None:
-        model._add_fit_data_group(model.data)
+        model._set_fit_data_group(model.data)
 
 
 def create_mock_fit(params: dict[str, float]):
