@@ -350,13 +350,13 @@ class ParetoNBDModel(CLVModel):
                 dims=["customer_id", "obs_var"],
             )
 
-    def fit(
+    def fit(  # type: ignore[override]
         self,
         data: pd.DataFrame | None = None,
-        method: str = "map",
+        method: Literal["mcmc", "map", "demz", "advi", "fullrank_advi"] = "map",
         fit_method: str | None = None,
         **kwargs,
-    ):  # type: ignore
+    ):
         """Infer posteriors of model parameters to run predictions.
 
         Parameters
@@ -381,7 +381,7 @@ class ParetoNBDModel(CLVModel):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            method = fit_method
+            method = fit_method  # type: ignore[assignment]
 
         if method == "mcmc":
             # Include rewrite in mode

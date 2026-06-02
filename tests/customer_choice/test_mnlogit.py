@@ -181,6 +181,20 @@ def test_sample(mnl, mock_pymc_sample):
         )
 
 
+def test_fit_includes_deterministics_in_posterior(
+    sample_df, utility_eqs, mock_pymc_sample
+):
+    """The consolidated MCMC path samples free RVs only, then merges deterministics."""
+    model = MNLogit(sample_df, utility_eqs, "choice", ["X1", "X2"])
+
+    idata = model.fit(chains=1, draws=5, tune=0)
+
+    assert isinstance(idata, az.InferenceData)
+    # Deterministics declared in build_model must round-trip through compute_deterministics
+    assert "p" in idata.posterior
+    assert "U" in idata.posterior
+
+
 def test_counterfactual(mnl, mock_pymc_sample):
     X, F, y = mnl.preprocess_model_data(mnl.choice_df, mnl.utility_equations)
     _ = mnl.make_model(X, F, y)
