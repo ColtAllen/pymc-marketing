@@ -23,6 +23,7 @@ from pymc_marketing.clv.models import (
     ShiftedBetaGeoModel,
 )
 from pymc_marketing.clv.plotting import (
+    plot_cohorts,
     plot_customer_exposure,
     plot_expected_purchases_over_time,
     plot_expected_purchases_ppc,
@@ -45,6 +46,7 @@ __all__ = (
     "ParetoNBDModel",
     "ShiftedBetaGeoModel",
     "customer_lifetime_value",
+    "plot_cohorts",
     "plot_customer_exposure",
     "plot_expected_purchases_over_time",
     "plot_expected_purchases_ppc",
