@@ -21,7 +21,7 @@ import xarray
 from pandas.testing import assert_frame_equal
 from pymc_extras.prior import Prior
 
-from pymc_marketing.clv import GammaGammaModel, ParetoNBDModel
+from pymc_marketing.clv import BetaGeoModel, GammaGammaModel
 from pymc_marketing.clv.utils import (
     _expected_cumulative_transactions,
     _find_first_transactions,
@@ -80,44 +80,6 @@ def fitted_gg(test_summary_data) -> GammaGammaModel:
     set_model_fit(model, fake_fit)
 
     return model
-
-
-# TODO: Consolidate this fixture into the tests requiring it?
-@pytest.fixture()
-def df_cum_transactions():
-    cdnow_transactions = pd.read_csv("data/cdnow_transactions.csv")
-
-    rfm_data = rfm_summary(
-        cdnow_transactions,
-        customer_id_col="id",
-        datetime_col="date",
-        datetime_format="%Y%m%d",
-        time_unit="D",
-        observation_period_end="19970930",
-        time_scaler=7,
-    )
-
-    model_config = {
-        "r": Prior("HalfFlat"),
-        "alpha": Prior("HalfFlat"),
-        "s": Prior("HalfFlat"),
-        "beta": Prior("HalfFlat"),
-    }
-
-    pnbd = ParetoNBDModel(model_config=model_config)
-    pnbd.fit(data=rfm_data)
-
-    df_cum = _expected_cumulative_transactions(
-        model=pnbd,
-        transactions=cdnow_transactions,
-        customer_id_col="id",
-        datetime_col="date",
-        t=25 * 7,
-        datetime_format="%Y%m%d",
-        time_unit="D",
-        time_scaler=7,
-    )
-    return df_cum
 
 
 class TestCustomerLifetimeValue:
@@ -981,10 +943,22 @@ def test_expected_cumulative_transactions_dedups_inside_a_time_period(
     https://github.com/CamDavidsonPilon/lifetimes/blob/master/tests/test_utils.py#L623
     """
     by_week = _expected_cumulative_transactions(
-        fitted_bg, cdnow_trans, "date", "id", 10, time_unit="W"
+        fitted_bg,
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        t=10,
+        datetime_format="%Y%m%d",
+        time_unit="W",
     )
     by_day = _expected_cumulative_transactions(
-        fitted_bg, cdnow_trans, "date", "id", 10, time_unit="D"
+        fitted_bg,
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        t=10,
+        datetime_format="%Y%m%d",
+        time_unit="D",
     )
     assert (by_week["actual"] >= by_day["actual"]).all()
 
@@ -1078,3 +1052,25 @@ def test_expected_cumulative_transactions_date_index(fitted_bg, cdnow_trans):
     assert all(dates == date_index)
     np.testing.assert_allclose(actual, actual_trans)
     np.testing.assert_allclose(predicted, expected_trans, rtol=1e-2)
+
+
+def test_expected_cumulative_transactions_rejects_covariate_models(cdnow_trans):
+    """The aggregation requires expected purchases to depend on elapsed time alone."""
+    model = BetaGeoModel(
+        model_config={
+            "purchase_covariate_cols": ["purchase_cov"],
+            "dropout_covariate_cols": [],
+        },
+    )
+
+    with pytest.raises(
+        NotImplementedError, match=r"Covariate models are not supported"
+    ):
+        _expected_cumulative_transactions(
+            model=model,
+            transactions=cdnow_trans,
+            customer_id_col="id",
+            datetime_col="date",
+            t=10,
+            datetime_format="%Y%m%d",
+        )
