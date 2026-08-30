@@ -995,23 +995,27 @@ def test_expected_cumulative_incremental_transactions_equals_r_btyd_walkthrough(
         time_scaler=7,
     )
 
+    # ``predicted`` retains the posterior, so collapse it to compare against point estimates
+    cum_predicted = df_cum_trans["predicted"].mean(("chain", "draw"))
+
     actual_btyd = [1359, 1414, 1484, 1517, 1573, 1672]
     expected_btyd = [1309, 1385, 1460, 1533, 1604, 1674]
 
-    actual = df_cum_trans["actual"].iloc[19:25].values
-    predicted = df_cum_trans["predicted"].iloc[19:25].values.round()
+    actual = df_cum_trans["actual"].values[19:25]
+    predicted = cum_predicted.values[19:25].round()
 
     np.testing.assert_allclose(actual, actual_btyd)
     np.testing.assert_allclose(predicted, expected_btyd, rtol=1e-1)
 
     # get incremental from cumulative transactions
-    df_inc_trans = df_cum_trans.apply(lambda x: x - x.shift(1))
+    inc_trans = df_cum_trans.diff("period")
 
     actual_btyd = [73.00, 55.00, 70.00, 33.00, 56.00, 99.00]
     expected_btyd = [78.31, 76.42, 74.65, 72.98, 71.41, 69.93]
 
-    actual = df_inc_trans["actual"].iloc[19:25].values
-    predicted = df_inc_trans["predicted"].iloc[19:25].values.round(2)
+    # ``diff`` drops the leading period, so the same rows sit one index earlier
+    actual = inc_trans["actual"].values[18:24]
+    predicted = inc_trans["predicted"].mean(("chain", "draw")).values[18:24].round(2)
 
     np.testing.assert_allclose(actual, actual_btyd)
     np.testing.assert_allclose(predicted, expected_btyd, rtol=1e-2)
@@ -1045,9 +1049,9 @@ def test_expected_cumulative_transactions_date_index(fitted_bg, cdnow_trans):
     # rather than fitting a new model to a different subset of the data
     expected_trans = [76.27, 88.42, 101.53, 115.28]
 
-    date_index = df_cum.iloc[-4:].index.to_timestamp().astype(str)
-    actual = df_cum["actual"].iloc[-4:].values
-    predicted = df_cum["predicted"].iloc[-4:].values.round(2)
+    date_index = pd.DatetimeIndex(df_cum["period"].values[-4:]).strftime("%Y-%m-%d")
+    actual = df_cum["actual"].values[-4:]
+    predicted = df_cum["predicted"].mean(("chain", "draw")).values[-4:].round(2)
 
     assert all(dates == date_index)
     np.testing.assert_allclose(actual, actual_trans)

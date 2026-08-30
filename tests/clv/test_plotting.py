@@ -163,8 +163,9 @@ def test_plot_probability_alive_matrix_with_ax(mock_model) -> None:
     "plot_cumulative, set_index_date, subplot",
     [(True, False, None), (False, True, plt.subplot())],
 )
+@pytest.mark.parametrize("hdi_prob", [None, 0.94])
 def test_plot_expected_purchases_over_time(
-    mock_model, cdnow_trans, plot_cumulative, set_index_date, subplot
+    mock_model, cdnow_trans, plot_cumulative, set_index_date, subplot, hdi_prob
 ) -> None:
     ax = plot_expected_purchases_over_time(
         model=mock_model,
@@ -175,15 +176,67 @@ def test_plot_expected_purchases_over_time(
         time_unit="D",
         plot_cumulative=plot_cumulative,
         set_index_date=set_index_date,
+        hdi_prob=hdi_prob,
         t=10,
         t_start_eval=8,
         ax=subplot,
     )
 
     assert isinstance(ax, plt.Axes)
+    # the parametrized Axes is shared between runs, so check for artists rather than count them
+    assert {"actual", "predicted"} <= {line.get_label() for line in ax.lines}
+    if hdi_prob is not None:
+        assert any(f"{hdi_prob:.0%} HDI" in band.get_label() for band in ax.collections)
 
     # clear any existing pyplot figures
     plt.clf()
+
+
+def test_plot_expected_purchases_over_time_has_no_band_by_default(
+    mock_model, cdnow_trans
+) -> None:
+    _, fresh = plt.subplots()
+
+    ax = plot_expected_purchases_over_time(
+        model=mock_model,
+        purchase_history=cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit="D",
+        t=10,
+        ax=fresh,
+    )
+
+    assert len(ax.collections) == 0
+
+    plt.close("all")
+
+
+def test_plot_expected_purchases_over_time_hdi_brackets_the_mean(
+    mock_model, cdnow_trans
+) -> None:
+    _, fresh = plt.subplots()
+
+    ax = plot_expected_purchases_over_time(
+        model=mock_model,
+        purchase_history=cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit="D",
+        hdi_prob=0.94,
+        t=10,
+        ax=fresh,
+    )
+
+    predicted = ax.lines[1].get_ydata()
+    band = ax.collections[0].get_paths()[0].vertices
+
+    assert band[:, 1].min() <= predicted.min()
+    assert band[:, 1].max() >= predicted.max()
+
+    plt.close("all")
 
 
 def test_plot_expected_purchases_ppc_exceptions(fitted_model):
