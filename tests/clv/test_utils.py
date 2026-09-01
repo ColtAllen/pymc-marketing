@@ -21,7 +21,7 @@ import xarray
 from pandas.testing import assert_frame_equal
 from pymc_extras.prior import Prior
 
-from pymc_marketing.clv import GammaGammaModel, ParetoNBDModel
+from pymc_marketing.clv import BetaGeoModel, GammaGammaModel
 from pymc_marketing.clv.utils import (
     _expected_cumulative_transactions,
     _find_first_transactions,
@@ -80,44 +80,6 @@ def fitted_gg(test_summary_data) -> GammaGammaModel:
     set_model_fit(model, fake_fit)
 
     return model
-
-
-# TODO: Consolidate this fixture into the tests requiring it?
-@pytest.fixture()
-def df_cum_transactions():
-    cdnow_transactions = pd.read_csv("data/cdnow_transactions.csv")
-
-    rfm_data = rfm_summary(
-        cdnow_transactions,
-        customer_id_col="id",
-        datetime_col="date",
-        datetime_format="%Y%m%d",
-        time_unit="D",
-        observation_period_end="19970930",
-        time_scaler=7,
-    )
-
-    model_config = {
-        "r": Prior("HalfFlat"),
-        "alpha": Prior("HalfFlat"),
-        "s": Prior("HalfFlat"),
-        "beta": Prior("HalfFlat"),
-    }
-
-    pnbd = ParetoNBDModel(model_config=model_config)
-    pnbd.fit(data=rfm_data)
-
-    df_cum = _expected_cumulative_transactions(
-        model=pnbd,
-        transactions=cdnow_transactions,
-        customer_id_col="id",
-        datetime_col="date",
-        t=25 * 7,
-        datetime_format="%Y%m%d",
-        time_unit="D",
-        time_scaler=7,
-    )
-    return df_cum
 
 
 class TestCustomerLifetimeValue:
@@ -981,10 +943,22 @@ def test_expected_cumulative_transactions_dedups_inside_a_time_period(
     https://github.com/CamDavidsonPilon/lifetimes/blob/master/tests/test_utils.py#L623
     """
     by_week = _expected_cumulative_transactions(
-        fitted_bg, cdnow_trans, "date", "id", 10, time_unit="W"
+        fitted_bg,
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        t=10,
+        datetime_format="%Y%m%d",
+        time_unit="W",
     )
     by_day = _expected_cumulative_transactions(
-        fitted_bg, cdnow_trans, "date", "id", 10, time_unit="D"
+        fitted_bg,
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        t=10,
+        datetime_format="%Y%m%d",
+        time_unit="D",
     )
     assert (by_week["actual"] >= by_day["actual"]).all()
 
@@ -1021,23 +995,27 @@ def test_expected_cumulative_incremental_transactions_equals_r_btyd_walkthrough(
         time_scaler=7,
     )
 
+    # ``predicted`` retains the posterior, so collapse it to compare against point estimates
+    cum_predicted = df_cum_trans["predicted"].mean(("chain", "draw"))
+
     actual_btyd = [1359, 1414, 1484, 1517, 1573, 1672]
     expected_btyd = [1309, 1385, 1460, 1533, 1604, 1674]
 
-    actual = df_cum_trans["actual"].iloc[19:25].values
-    predicted = df_cum_trans["predicted"].iloc[19:25].values.round()
+    actual = df_cum_trans["actual"].values[19:25]
+    predicted = cum_predicted.values[19:25].round()
 
     np.testing.assert_allclose(actual, actual_btyd)
     np.testing.assert_allclose(predicted, expected_btyd, rtol=1e-1)
 
     # get incremental from cumulative transactions
-    df_inc_trans = df_cum_trans.apply(lambda x: x - x.shift(1))
+    inc_trans = df_cum_trans.diff("period")
 
     actual_btyd = [73.00, 55.00, 70.00, 33.00, 56.00, 99.00]
     expected_btyd = [78.31, 76.42, 74.65, 72.98, 71.41, 69.93]
 
-    actual = df_inc_trans["actual"].iloc[19:25].values
-    predicted = df_inc_trans["predicted"].iloc[19:25].values.round(2)
+    # ``diff`` drops the leading period, so the same rows sit one index earlier
+    actual = inc_trans["actual"].values[18:24]
+    predicted = inc_trans["predicted"].mean(("chain", "draw")).values[18:24].round(2)
 
     np.testing.assert_allclose(actual, actual_btyd)
     np.testing.assert_allclose(predicted, expected_btyd, rtol=1e-2)
@@ -1071,10 +1049,32 @@ def test_expected_cumulative_transactions_date_index(fitted_bg, cdnow_trans):
     # rather than fitting a new model to a different subset of the data
     expected_trans = [76.27, 88.42, 101.53, 115.28]
 
-    date_index = df_cum.iloc[-4:].index.to_timestamp().astype(str)
-    actual = df_cum["actual"].iloc[-4:].values
-    predicted = df_cum["predicted"].iloc[-4:].values.round(2)
+    date_index = pd.DatetimeIndex(df_cum["period"].values[-4:]).strftime("%Y-%m-%d")
+    actual = df_cum["actual"].values[-4:]
+    predicted = df_cum["predicted"].mean(("chain", "draw")).values[-4:].round(2)
 
     assert all(dates == date_index)
     np.testing.assert_allclose(actual, actual_trans)
     np.testing.assert_allclose(predicted, expected_trans, rtol=1e-2)
+
+
+def test_expected_cumulative_transactions_rejects_covariate_models(cdnow_trans):
+    """The aggregation requires expected purchases to depend on elapsed time alone."""
+    model = BetaGeoModel(
+        model_config={
+            "purchase_covariate_cols": ["purchase_cov"],
+            "dropout_covariate_cols": [],
+        },
+    )
+
+    with pytest.raises(
+        NotImplementedError, match=r"Covariate models are not supported"
+    ):
+        _expected_cumulative_transactions(
+            model=model,
+            transactions=cdnow_trans,
+            customer_id_col="id",
+            datetime_col="date",
+            t=10,
+            datetime_format="%Y%m%d",
+        )

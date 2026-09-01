@@ -833,6 +833,11 @@ def _expected_cumulative_transactions(
     first transaction before the specified number of ``t`` time periods, run ``expected_purchases_new_customer()``
     for all remaining time periods, then sum across the customer population.
 
+    ``expected_purchases_new_customer()`` is the unconditional expectation, so it depends on elapsed time alone and
+    is evaluated once over the whole grid of elapsed periods. The reported series is then a discrete convolution of
+    that curve with the number of customers acquired in each period, which is exact rather than an approximation.
+    Covariate models are not supported, because their expected purchases vary by customer.
+
     Adapted from legacy ``lifetimes`` library:
     https://github.com/CamDavidsonPilon/lifetimes/blob/master/lifetimes/utils.py#L506
 
@@ -865,8 +870,14 @@ def _expected_cumulative_transactions(
 
     Returns
     -------
-    DataFrame
-        Dataframe containing columns for actual and predicted values
+    ~xarray.Dataset
+        Dataset with a ``period`` dimension holding:
+
+        * ``actual``: observed cumulative repeat transactions.
+        * ``predicted``: expected cumulative repeat transactions, retaining the ``chain`` and
+          ``draw`` dimensions so that uncertainty can be summarized by the caller.
+
+        ``period`` is an integer index, or the start of each period when *set_index_date* is *True*.
 
     References
     ----------
@@ -879,6 +890,12 @@ def _expected_cumulative_transactions(
     ).min()
     start_period = start_date.to_period(time_unit)
     observation_period_end = start_period + t
+
+    if getattr(model, "covariate_cols", []):
+        raise NotImplementedError(
+            "Covariate models are not supported, because the expected purchases of a new "
+            "customer then vary by customer rather than by elapsed time alone."
+        )
 
     # Has an extra column (besides the id and the date)
     # with a boolean for when it is a first transaction
@@ -900,59 +917,65 @@ def _expected_cumulative_transactions(
     date_range = pandas.date_range(start_date, periods=t + 1, freq=time_unit)
     date_periods = date_range.to_period(time_unit)
 
-    pred_cum_transactions = np.array([])
-
     # First Transactions on Each Day/Freq
     first_trans_size = first_transactions.groupby(datetime_col).size()
 
-    # In the loop below, we calculate the expected number of purchases for customers
-    # who have made their first purchases on a date before the one being evaluated.
-    # Then we sum them to get the cumulative sum up to the specific period.
-    for i, period in enumerate(date_periods):  # index of period and its date
-        if i % time_scaler == 0 and i > 0:  # type: ignore
-            # Periods before the one being evaluated
-            times = np.array([d.n for d in period - first_trans_size.index])  # type: ignore[operator]
-            times = times[times > 0].astype(float) / time_scaler
+    step = int(time_scaler)  # type: ignore[arg-type]
+    n_periods = t // step
 
-            # create arbitrary dataframe from array of n time periods for predictions
-            pred_data = pandas.DataFrame(
-                {
-                    "customer_id": times,
-                    "t": times,
-                }
-            )
+    # ``expected_purchases_new_customer`` is the *unconditional* expectation, whose parameters
+    # are population-level per posterior draw, so it is a function of elapsed time alone. Every
+    # period below reuses that one curve, which therefore only has to be evaluated once, over
+    # the whole grid of attainable elapsed periods, rather than once per period. Because that
+    # is a single call the posterior comes back for free, so it is carried through rather than
+    # averaged away here.
+    elapsed = np.arange(1, t + 1)
+    pred_data = pandas.DataFrame({"customer_id": elapsed, "t": elapsed / step})
+    expected_trans_curve = model.expected_purchases_new_customer(pred_data)
 
-            # Array of different expected number of purchases for different times
-            # TODO: This does not currently support a covariate model
-            expected_trans_array = model.expected_purchases_new_customer(
-                pred_data
-            ).mean(dim=("chain", "draw"))
+    # Customers acquired in each period, indexed by offset from ``start_period``.
+    acquisition_offsets = (
+        np.asarray(first_trans_size.index.astype("int64")) - start_period.ordinal
+    )
+    acquired = np.bincount(
+        acquisition_offsets,
+        weights=first_trans_size.to_numpy(),
+        minlength=t + 1,
+    )[: t + 1]
 
-            # Mask for the number of customers with 1st transactions up to the period
-            mask = first_trans_size.index < period
-            masked_first_trans = first_trans_size[mask].values  # type: ignore
-            # ``expected_trans`` is an xarray with the cumulative sum of expected transactions
-            expected_trans = (expected_trans_array * masked_first_trans).sum()
-            pred_cum_transactions = np.append(
-                pred_cum_transactions, expected_trans.values
-            )
+    # Cumulative expected transactions at period ``i`` add up every earlier acquisition cohort
+    # evaluated at its own age, ``sum over d < i of acquired[d] * curve[i - d]``. Only the
+    # ``n_periods`` reported rows are needed, so that convolution is applied as a single
+    # contraction against the customers acquired at each lag, which keeps the posterior
+    # dimensions intact.
+    reported = np.arange(1, n_periods + 1) * step
+    lag = reported[:, None] - elapsed[None, :]
+    weights = xarray.DataArray(
+        np.where(lag >= 0, acquired[np.clip(lag, 0, None)], 0.0),
+        dims=("period", "customer_id"),
+        coords={"customer_id": elapsed},
+    )
+    pred_cum_transactions = xarray.dot(
+        weights, expected_trans_curve, dim="customer_id"
+    ).transpose("chain", "draw", "period")
 
     act_trans = repeated_transactions.groupby(datetime_col).size()
     act_tracking_transactions = act_trans.reindex(date_periods, fill_value=0)
 
-    act_cum_transactions = []
-    for j in range(1, t // time_scaler + 1):  # type: ignore
-        sum_trans = sum(act_tracking_transactions.iloc[: j * time_scaler])  # type: ignore
-        act_cum_transactions.append(sum_trans)
+    act_cum_transactions = act_tracking_transactions.cumsum().to_numpy()[
+        step - 1 :: step
+    ][:n_periods]
 
     if set_index_date:
-        index = date_periods[time_scaler - 1 : -1 : time_scaler]  # type: ignore
+        # Period starts, since xarray has no native Period dtype.
+        period_coord = date_periods[step - 1 : -1 : step].to_timestamp()
     else:
-        index = range(0, t // time_scaler)  # type: ignore
+        period_coord = np.arange(n_periods)  # type: ignore[assignment]
 
-    df_cum_transactions = pandas.DataFrame(
-        {"actual": act_cum_transactions, "predicted": pred_cum_transactions},
-        index=index,
+    return xarray.Dataset(
+        {
+            "actual": ("period", act_cum_transactions),
+            "predicted": pred_cum_transactions.drop_vars("period", errors="ignore"),
+        },
+        coords={"period": period_coord},
     )
-
-    return df_cum_transactions

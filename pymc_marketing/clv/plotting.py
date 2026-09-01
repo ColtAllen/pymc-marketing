@@ -17,6 +17,7 @@ import warnings
 from collections.abc import Sequence
 from typing import Literal
 
+import arviz as az
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import numpy as np
@@ -719,6 +720,7 @@ def plot_expected_purchases_over_time(
     datetime_col: str,
     t: int,
     plot_cumulative: bool = True,
+    hdi_prob: float | Sequence[float] | None = None,
     t_start_eval: int | None = None,
     datetime_format: str | None = None,
     time_unit: str = "D",
@@ -756,6 +758,11 @@ def plot_expected_purchases_over_time(
     plot_cumulative : bool
         Default: *True*
         Plot cumulative purchases over time. Set to *False* to plot incremental purchases.
+    hdi_prob : float or sequence of float, optional
+        Probability mass of a highest density interval to shade around the predicted line, for
+        example ``0.94``. Pass a sequence such as ``[0.5, 0.94]`` to nest several bands, which
+        are drawn widest first so the narrower ones read as more opaque. Defaults to *None*,
+        which plots the posterior mean alone.
     t_start_eval : int, optional
         If testing model on unobserved data, specify number of time units in training data to add an indicator for
         the start of the testing period.
@@ -783,7 +790,7 @@ def plot_expected_purchases_over_time(
     ax : matplotlib.Axes, optional
         A matplotlib Axes instance. Creates new axes instance by default.
     kwargs
-        Additional arguments to pass into the pandas.DataFrame.plot command.
+        Additional arguments to pass into the matplotlib.Axes.plot command.
 
     Returns
     -------
@@ -798,7 +805,7 @@ def plot_expected_purchases_over_time(
     if ax is None:
         ax = plt.subplot(111)
 
-    df_cum_purchases = _expected_cumulative_transactions(
+    purchases = _expected_cumulative_transactions(
         model=model,
         transactions=purchase_history,
         customer_id_col=customer_id_col,
@@ -810,26 +817,52 @@ def plot_expected_purchases_over_time(
         sort_transactions=sort_purchases,
         set_index_date=set_index_date,
     )
+    periods = purchases["period"]
 
     if not plot_cumulative:
-        df_cum_purchases = df_cum_purchases.diff()
+        # Reindexing restores the leading period as a gap, so that the incremental plot spans
+        # the same x-axis as the cumulative one.
+        purchases = purchases.diff("period").reindex(period=periods)
         if title is None:
             title = "Tracking Incremental Transactions"
     else:
         if title is None:
             title = "Tracking Cumulative Transactions"
 
-    # TODO: After utility func supports xarrays, refactor this for matplotlib API.
-    ax = df_cum_purchases.plot(ax=ax, title=title, **kwargs)
+    x = periods.to_numpy()
+    predicted = purchases["predicted"]
+
+    ax.plot(x, purchases["actual"].to_numpy(), label="actual", **kwargs)
+    (predicted_line,) = ax.plot(
+        x, predicted.mean(("chain", "draw")).to_numpy(), label="predicted", **kwargs
+    )
+
+    if hdi_prob is not None:
+        probs = [hdi_prob] if isinstance(hdi_prob, float | int) else list(hdi_prob)
+        # Widest first, so that overlapping fills leave the narrower intervals more opaque.
+        for prob in sorted(probs, reverse=True):
+            # The interval is taken on the differenced posterior rather than by differencing
+            # the bounds, which would not be an interval on the incremental quantity.
+            hdi = az.hdi(predicted, prob=prob, dim=("chain", "draw"))
+            ax.fill_between(
+                x,
+                hdi.sel(ci_bound="lower").to_numpy(),
+                hdi.sel(ci_bound="upper").to_numpy(),
+                # matplotlib would otherwise take the next colour in the cycle, which is the
+                # one already used for `actual`, implying the band belongs to that series.
+                color=predicted_line.get_color(),
+                alpha=0.25,
+                label=f"predicted ({prob:.0%} HDI)",
+            )
 
     if t_start_eval:
-        if set_index_date:
-            x_vline = df_cum_purchases.index[int(t_start_eval)]
-        else:
-            x_vline = t_start_eval
+        x_vline = x[int(t_start_eval)] if set_index_date else t_start_eval
         ax.axvline(x=x_vline, color="r", linestyle="--")
+
+    ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    ax.legend()
     return ax
 
 
