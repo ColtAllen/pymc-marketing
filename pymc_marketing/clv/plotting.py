@@ -720,7 +720,7 @@ def plot_expected_purchases_over_time(
     datetime_col: str,
     t: int,
     plot_cumulative: bool = True,
-    hdi_prob: float | None = None,
+    hdi_prob: float | Sequence[float] | None = None,
     t_start_eval: int | None = None,
     datetime_format: str | None = None,
     time_unit: str = "D",
@@ -758,9 +758,11 @@ def plot_expected_purchases_over_time(
     plot_cumulative : bool
         Default: *True*
         Plot cumulative purchases over time. Set to *False* to plot incremental purchases.
-    hdi_prob : float, optional
+    hdi_prob : float or sequence of float, optional
         Probability mass of a highest density interval to shade around the predicted line, for
-        example ``0.94``. Defaults to *None*, which plots the posterior mean alone.
+        example ``0.94``. Pass a sequence such as ``[0.5, 0.94]`` to nest several bands, which
+        are drawn widest first so the narrower ones read as more opaque. Defaults to *None*,
+        which plots the posterior mean alone.
     t_start_eval : int, optional
         If testing model on unobserved data, specify number of time units in training data to add an indicator for
         the start of the testing period.
@@ -831,21 +833,27 @@ def plot_expected_purchases_over_time(
     predicted = purchases["predicted"]
 
     ax.plot(x, purchases["actual"].to_numpy(), label="actual", **kwargs)
-    ax.plot(
+    (predicted_line,) = ax.plot(
         x, predicted.mean(("chain", "draw")).to_numpy(), label="predicted", **kwargs
     )
 
     if hdi_prob is not None:
-        # The interval is taken on the differenced posterior rather than by differencing the
-        # bounds, which would not be an interval on the incremental quantity.
-        hdi = az.hdi(predicted, prob=hdi_prob, dim=("chain", "draw"))
-        ax.fill_between(
-            x,
-            hdi.sel(ci_bound="lower").to_numpy(),
-            hdi.sel(ci_bound="upper").to_numpy(),
-            alpha=0.25,
-            label=f"predicted ({hdi_prob:.0%} HDI)",
-        )
+        probs = [hdi_prob] if isinstance(hdi_prob, float | int) else list(hdi_prob)
+        # Widest first, so that overlapping fills leave the narrower intervals more opaque.
+        for prob in sorted(probs, reverse=True):
+            # The interval is taken on the differenced posterior rather than by differencing
+            # the bounds, which would not be an interval on the incremental quantity.
+            hdi = az.hdi(predicted, prob=prob, dim=("chain", "draw"))
+            ax.fill_between(
+                x,
+                hdi.sel(ci_bound="lower").to_numpy(),
+                hdi.sel(ci_bound="upper").to_numpy(),
+                # matplotlib would otherwise take the next colour in the cycle, which is the
+                # one already used for `actual`, implying the band belongs to that series.
+                color=predicted_line.get_color(),
+                alpha=0.25,
+                label=f"predicted ({prob:.0%} HDI)",
+            )
 
     if t_start_eval:
         x_vline = x[int(t_start_eval)] if set_index_date else t_start_eval

@@ -13,6 +13,7 @@
 #   limitations under the License.
 import warnings
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -210,6 +211,34 @@ def test_plot_expected_purchases_over_time_has_no_band_by_default(
 
     assert len(ax.collections) == 0
 
+    plt.close("all")
+
+
+def test_plot_expected_purchases_over_time_stacked_hdi(mock_model, cdnow_trans) -> None:
+    _, fresh = plt.subplots()
+
+    ax = plot_expected_purchases_over_time(
+        model=mock_model,
+        purchase_history=cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit="D",
+        hdi_prob=[0.8, 0.94],
+        t=10,
+        ax=fresh,
+    )
+
+    bands = [band.get_label() for band in ax.collections]
+
+    # widest first, so overlapping fills leave the narrower interval more opaque
+    assert bands == ["predicted (94% HDI)", "predicted (80% HDI)"]
+    # the band belongs to the predicted line, so it must not borrow the actual line's colour
+    predicted_color = ax.lines[1].get_color()
+    for band in ax.collections:
+        assert mcolors.to_hex(band.get_facecolor()[0][:3]) == mcolors.to_hex(
+            predicted_color
+        )
     plt.close("all")
 
 
