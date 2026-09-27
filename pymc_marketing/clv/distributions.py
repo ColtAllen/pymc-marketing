@@ -13,6 +13,8 @@
 #   limitations under the License.
 """Distributions for the CLV module."""
 
+import functools
+
 import numpy as np
 import pytensor.tensor as pt
 from pymc.distributions.continuous import PositiveContinuous
@@ -205,6 +207,146 @@ class ParetoNBD(PositiveContinuous):
             beta > 0,
             msg="r > 0, alpha > 0, s > 0, beta > 0",
         )
+
+
+@functools.cache
+def _gauss_legendre_constants(n_nodes: int) -> tuple[np.ndarray, np.ndarray]:
+    """Nodes on [-1, 1] and log-weights of the ``n_nodes``-point Gauss-Legendre rule."""
+    nodes, weights = np.polynomial.legendre.leggauss(n_nodes)
+    return nodes, np.log(weights)
+
+
+def _pareto_nbd_logp_quadrature(
+    value,
+    r,
+    alpha,
+    s,
+    beta,
+    T,
+    *,
+    n_nodes: int = 128,
+    log_substitution: bool = True,
+):
+    r"""Pareto/NBD log-likelihood evaluated with fixed-node Gauss-Legendre quadrature.
+
+    Experimental alternative to :meth:`ParetoNBD.logp` that avoids ``hyp2f1``.
+    Equation (22) of Fader & Hardie (2005) [1]_ writes the likelihood as
+
+    .. math::
+
+        \mathbb{L}(r, \alpha, s, \beta \mid x, t_x, T) =
+        \frac{\Gamma(r+x)\alpha^r\beta^s}{\Gamma(r)}
+        \left[ \frac{1}{(\alpha+T)^{r+x}(\beta+T)^{s}}
+        + s \int_{t_x}^{T} \frac{d\tau}{(\alpha+\tau)^{r+x}(\beta+\tau)^{s+1}} \right]
+
+    The closed form replaces the integral with two Gaussian hypergeometric functions.
+    Here the integral is instead approximated with an ``n_nodes``-point Gauss-Legendre rule,
+    which needs only ``log``, ``gammaln``, ``logsumexp`` and ``logaddexp``.
+
+    Parameters
+    ----------
+    value : tensor_like
+        Array whose last axis holds ``(t_x, x)``: recency and frequency.
+    r, alpha, s, beta : tensor_like
+        Pareto/NBD parameters. Must broadcast against ``value[..., 0]``.
+    T : tensor_like
+        Observation period of each customer.
+    n_nodes : int, default 128
+        Number of quadrature nodes.
+    log_substitution : bool, default True
+        If ``True``, integrate in :math:`u = \log(\alpha + \tau)` instead of :math:`\tau`.
+        This concentrates nodes where the integrand is steep, which matters for heavy buyers
+        (large ``x``) and for small ``t_x`` when :math:`\beta \ll \alpha`.
+
+    Notes
+    -----
+    Against 40-digit mpmath references (``scripts/data_generators/pareto_nbd_quadrature_reference.py``),
+    the log-substituted rule with 128 nodes agrees to about 1e-9 for frequencies up to 500, where
+    ``pt.hyp2f1`` itself overflows or returns NaN. With 32 nodes it is accurate to 1e-4 only for
+    ``x <= 20``. The plain rule in :math:`\tau` is off by whole nats at 128 nodes and needs more
+    than 512 nodes once ``x >= 80``, so it is kept only for comparison.
+
+    Returns
+    -------
+    TensorVariable
+        Log-likelihood with the broadcast batch shape of the inputs.
+
+    References
+    ----------
+    .. [1] Fader, Peter & G. S. Hardie, Bruce (2005).
+           "A Note on Deriving the Pareto/NBD Model and Related Expressions."
+           http://brucehardie.com/notes/009/pareto_nbd_derivations_2005-11-05.pdf
+    """
+    nodes, log_weights = _gauss_legendre_constants(n_nodes)
+    # Map nodes from [-1, 1] onto [0, 1]
+    unit_nodes = pt.constant(0.5 * (nodes + 1.0))
+    log_weights = pt.constant(log_weights)
+
+    value = pt.as_tensor_variable(value)
+    t_x, x, r, alpha, s, beta, T = pt.broadcast_arrays(
+        value[..., 0],
+        value[..., 1],
+        *(pt.as_tensor_variable(p) for p in (r, alpha, s, beta, T)),
+    )
+
+    rx = r + x
+    # Guards the t_x == T case: a zero-width interval would give log(0) and NaN gradients.
+    eps = 1e-12
+
+    if log_substitution:
+        # u = log(alpha + tau); tau = t_x + (alpha + t_x) * expm1(u - u_lo) avoids cancellation.
+        u_lo = pt.log(alpha + t_x)
+        width = pt.maximum(pt.log(alpha + T) - u_lo, eps)
+        du = width[..., None] * unit_nodes
+        u = u_lo[..., None] + du
+        tau = t_x[..., None] + (alpha + t_x)[..., None] * pt.expm1(du)
+        # Integrand in u-space: (alpha + tau)^{-(r + x)} (beta + tau)^{-(s + 1)} e^{u}
+        log_f = -(rx[..., None] - 1) * u - (s[..., None] + 1) * pt.log(
+            beta[..., None] + tau
+        )
+    else:
+        width = pt.maximum(T - t_x, eps)
+        tau = t_x[..., None] + width[..., None] * unit_nodes
+        log_f = -rx[..., None] * pt.log(alpha[..., None] + tau) - (
+            s[..., None] + 1
+        ) * pt.log(beta[..., None] + tau)
+
+    log_integral = pt.log(width / 2) + pt.logsumexp(log_weights + log_f, axis=-1)
+
+    log_alive = -rx * pt.log(alpha + T) - s * pt.log(beta + T)
+    log_dropout = pt.log(s) + log_integral
+    log_bracket = pt.switch(
+        pt.ge(t_x, T), log_alive, pt.logaddexp(log_alive, log_dropout)
+    )
+
+    logp = (
+        pt.gammaln(rx)
+        - pt.gammaln(r)
+        + r * pt.log(alpha)
+        + s * pt.log(beta)
+        + log_bracket
+    )
+
+    logp = pt.switch(
+        pt.or_(
+            pt.or_(
+                pt.lt(t_x, 0),
+                pt.lt(x, 0),
+            ),
+            pt.gt(t_x, T),
+        ),
+        -np.inf,
+        logp,
+    )
+
+    return check_parameters(
+        logp,
+        r > 0,
+        alpha > 0,
+        s > 0,
+        beta > 0,
+        msg="r > 0, alpha > 0, s > 0, beta > 0",
+    )
 
 
 class BetaGeoBetaBinomRV(RandomVariable):
