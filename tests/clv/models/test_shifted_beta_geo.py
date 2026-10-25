@@ -20,6 +20,7 @@ from pytensor.compile import ViewOp
 from pytensor.tensor.elemwise import Elemwise
 
 from pymc_marketing.clv import ShiftedBetaGeoModel
+from pymc_marketing.clv._aggregation import UNIQUE_DIM
 from tests.clv.conftest import mock_sample
 
 
@@ -434,14 +435,14 @@ class TestShiftedBetaGeoModel:
             "\nkappa~Pareto(1,1)"
             "\nalpha=Deterministic(f(kappa,phi))"
             "\nbeta=Deterministic(f(kappa,phi))"
-            "\ndropout~Censored(ShiftedBetaGeometric(f(kappa,phi),f(kappa,phi)),-inf,<constant>)"
+            "\ndropout~CensoredShiftedBetaGeometric(f(alpha),f(beta),<constant>,1)"
         )
 
         custom_repr = (
             "ShiftedBeta-Geometric"
             "\nalpha~HalfNormal(0,10)"
             "\nbeta~HalfStudentT(4,10)"
-            "\ndropout~Censored(ShiftedBetaGeometric(f(alpha),f(beta)),-inf,<constant>)"
+            "\ndropout~CensoredShiftedBetaGeometric(f(alpha),f(beta),<constant>,1)"
         )
 
         for repr in zip(
@@ -1066,3 +1067,294 @@ class TestShiftedBetaGeoModel:
         # Verify alpha has proper dimensions
         assert "alpha" in dataset
         assert dataset["alpha"].dims[-1] == "cohort"  # After swap_dims
+
+
+FH_ALPHA = [0.668, 0.704]  # highend, regular (Fader & Hardie 2007, p. 7)
+FH_BETA = [3.806, 1.182]
+FH_TABLE = pd.DataFrame(
+    {
+        "cohort": ["highend"] * 8 + ["regular"] * 8,
+        "period": list(range(8)) * 2,
+        "n_alive": [
+            *[1000, 869, 743, 653, 593, 551, 517, 491],
+            *[1000, 631, 468, 382, 326, 289, 262, 241],
+        ],
+    }
+)
+
+
+def synthetic_covariate_data(n: int = 400, seed: int = 11) -> pd.DataFrame:
+    """Three cohorts with cohort-specific T and two categorical covariates."""
+    rng = np.random.default_rng(seed)
+    cohort = rng.choice(["c1", "c2", "c3"], size=n)
+    T = np.select([cohort == "c1", cohort == "c2"], [6, 8], default=5)
+    p = rng.beta(0.8, 2.0, size=n)
+    recency = np.minimum(rng.geometric(p), T)
+    return pd.DataFrame(
+        {
+            "customer_id": rng.permutation(np.arange(1, n + 1)),
+            "recency": recency,
+            "T": T,
+            "cohort": cohort,
+            "channel": rng.integers(0, 2, size=n),
+            "tier": rng.integers(1, 4, size=n),
+        }
+    )
+
+
+def mock_posterior(model, draws=20, chains=2, seed=0):
+    """Attach a mocked posterior with every variable the predictive methods read."""
+    rng = np.random.default_rng(seed)
+    cohorts = list(model.cohorts)
+    coords = {"chain": np.arange(chains), "draw": np.arange(draws), "cohort": cohorts}
+    size = (chains, draws, len(cohorts))
+    data = {}
+    if model.dropout_covariate_cols:
+        data["alpha_scale"] = (("chain", "draw", "cohort"), rng.gamma(2, 0.5, size))
+        data["beta_scale"] = (("chain", "draw", "cohort"), rng.gamma(2, 1.0, size))
+        coords["dropout_covariate"] = model.dropout_covariate_cols
+        csize = (chains, draws, len(model.dropout_covariate_cols))
+        data["dropout_coefficient_alpha"] = (
+            ("chain", "draw", "dropout_covariate"),
+            rng.normal(0, 0.3, csize),
+        )
+        data["dropout_coefficient_beta"] = (
+            ("chain", "draw", "dropout_covariate"),
+            rng.normal(0, 0.3, csize),
+        )
+    else:
+        data["alpha"] = (("chain", "draw", "cohort"), rng.gamma(2, 0.5, size))
+        data["beta"] = (("chain", "draw", "cohort"), rng.gamma(2, 1.0, size))
+    posterior = xr.Dataset(data, coords=coords)
+    model.idata = xr.DataTree.from_dict({"/posterior": posterior})
+    model.set_idata_attrs(model.idata)
+    model.idata["/fit_data"] = model.create_fit_data_group()
+    return model
+
+
+class TestShiftedBetaGeoAggregate:
+    """Opt-in weighted-count likelihood (``aggregate=True``) of ``ShiftedBetaGeoModel``."""
+
+    @pytest.fixture(scope="class")
+    def cohort_data(self) -> pd.DataFrame:
+        return pd.read_csv("data/sbg_cohorts.csv")
+
+    @pytest.fixture(scope="class")
+    def covariate_data(self) -> pd.DataFrame:
+        return synthetic_covariate_data()
+
+    @staticmethod
+    def _pair(data, model_config=None):
+        """Build the same model with and without aggregation."""
+        model_config = dict(model_config or {})
+        plain = ShiftedBetaGeoModel(model_config={**model_config, "aggregate": False})
+        agg = ShiftedBetaGeoModel(model_config={**model_config, "aggregate": True})
+        plain.build_model(data=data)
+        agg.build_model(data=data)
+        return plain, agg
+
+    def test_aggregate_flag_defaults_to_false(self):
+        assert ShiftedBetaGeoModel().model_config["aggregate"] is False
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            model = ShiftedBetaGeoModel(model_config={"aggregate": True})
+        assert model.model_config["aggregate"] is True
+
+    def test_default_graph_keeps_customer_dims(self, cohort_data):
+        model = ShiftedBetaGeoModel()
+        model.build_model(data=cohort_data)
+
+        assert UNIQUE_DIM not in model.model.coords
+        assert model.model.named_vars_to_dims["dropout"] == ("customer_id",)
+        assert "weights" not in model.model.named_vars
+        assert model.aggregation.compression_ratio == 1.0
+        np.testing.assert_array_equal(
+            model.aggregation.customer_id, cohort_data["customer_id"]
+        )
+
+    def test_aggregated_graph_uses_unique_obs(self, cohort_data):
+        model = ShiftedBetaGeoModel(model_config={"aggregate": True})
+        model.build_model(data=cohort_data)
+
+        agg = model.aggregation
+        assert agg.n_unique == 16  # 2 cohorts x 8 recency values
+        assert list(model.model.coords[UNIQUE_DIM]) == list(range(16))
+        assert list(model.model.coords["customer_id"]) == list(
+            cohort_data["customer_id"]
+        )
+        assert model.model.named_vars_to_dims["dropout"] == (UNIQUE_DIM,)
+        assert model.model.named_vars_to_dims["weights"] == (UNIQUE_DIM,)
+        np.testing.assert_array_equal(model.model["weights"].eval(), agg.weights)
+        assert agg.weights.sum() == len(cohort_data)
+
+    @pytest.mark.parametrize(
+        "dataset, model_config",
+        [
+            ("cohort_data", None),
+            (
+                "cohort_data",
+                {
+                    "alpha": Prior("HalfNormal", sigma=10, dims="cohort"),
+                    "beta": Prior("HalfStudentT", nu=4, sigma=10, dims="cohort"),
+                },
+            ),
+            ("covariate_data", {"dropout_covariate_cols": ["channel", "tier"]}),
+            (
+                "covariate_data",
+                {
+                    "alpha": Prior("HalfNormal", sigma=10, dims="cohort"),
+                    "beta": Prior("HalfStudentT", nu=4, sigma=10, dims="cohort"),
+                    "dropout_covariate_cols": ["channel", "tier"],
+                },
+            ),
+        ],
+        ids=["hier", "direct", "hier-covariates", "direct-covariates"],
+    )
+    def test_logp_and_gradient_match_unaggregated(self, request, dataset, model_config):
+        """A2: identical model log-density and gradient at shared points."""
+        data = request.getfixturevalue(dataset)
+        plain, agg = self._pair(data, model_config)
+
+        point = plain.model.initial_point()
+        assert set(point) == set(agg.model.initial_point())
+        rng = np.random.default_rng(5)
+        perturbed = {
+            k: v + 0.3 * rng.normal(size=np.shape(v)) for k, v in point.items()
+        }
+
+        logp_plain, logp_agg = plain.model.compile_logp(), agg.model.compile_logp()
+        dlogp_plain, dlogp_agg = plain.model.compile_dlogp(), agg.model.compile_dlogp()
+        for pt_ in (point, perturbed):
+            np.testing.assert_allclose(logp_agg(pt_), logp_plain(pt_), rtol=1e-10)
+            np.testing.assert_allclose(dlogp_agg(pt_), dlogp_plain(pt_), rtol=1e-10)
+
+    def test_covariate_branch_registers_customer_alpha_only_when_unaggregated(
+        self, covariate_data
+    ):
+        plain, agg = self._pair(
+            covariate_data, {"dropout_covariate_cols": ["channel", "tier"]}
+        )
+
+        assert plain.model.named_vars_to_dims["alpha"] == ("customer_id",)
+        assert "alpha" not in agg.model.named_vars
+        assert "beta" not in agg.model.named_vars
+        for name in ("alpha_scale", "beta_scale", "dropout_coefficient_alpha"):
+            assert name in agg.model.named_vars
+        assert agg.model.named_vars_to_dims["dropout_data"] == (
+            UNIQUE_DIM,
+            "dropout_covariate",
+        )
+
+    @pytest.mark.parametrize(
+        "dataset, model_config",
+        [
+            ("cohort_data", None),
+            ("covariate_data", {"dropout_covariate_cols": ["channel", "tier"]}),
+        ],
+        ids=["cohorts", "covariates"],
+    )
+    def test_predictive_methods_invariant(self, request, dataset, model_config):
+        """A6: every expected_* method returns identical customer-level arrays."""
+        data = request.getfixturevalue(dataset)
+        plain, agg = self._pair(data, model_config)
+        mock_posterior(plain)
+        agg.idata = plain.idata
+
+        for method, kwargs in [
+            ("expected_probability_alive", {"future_t": 2}),
+            ("expected_retention_rate", {"future_t": 1}),
+            ("expected_residual_lifetime", {"discount_rate": 0.05}),
+            ("expected_retention_elasticity", {"discount_rate": 0.05}),
+        ]:
+            expected = getattr(plain, method)(**kwargs)
+            got = getattr(agg, method)(**kwargs)
+            xr.testing.assert_identical(got, expected)
+
+    def test_save_load_roundtrip(self, cohort_data, tmp_path):
+        """A7: the aggregate flag, graph and id survive save/load without base-class changes."""
+        model = ShiftedBetaGeoModel(model_config={"aggregate": True})
+        model.build_model(data=cohort_data)
+        model.fit(data=cohort_data, method="map", progressbar=False)
+        model.save(tmp_path / "sbg_agg")
+
+        loaded = ShiftedBetaGeoModel.load(tmp_path / "sbg_agg")
+
+        assert loaded.model_config["aggregate"] is True
+        assert loaded.model_config == model.model_config
+        assert loaded.id == model.id
+        assert loaded.model.named_vars_to_dims["dropout"] == (UNIQUE_DIM,)
+        np.testing.assert_array_equal(
+            loaded.aggregation.weights, model.aggregation.weights
+        )
+        np.testing.assert_array_equal(
+            loaded.aggregation.inverse, model.aggregation.inverse
+        )
+        assert loaded.idata == model.idata
+
+        plain = ShiftedBetaGeoModel()
+        assert plain.id != model.id
+
+    def test_weight_column_enables_aggregation(self):
+        from pymc_marketing.clv._aggregation import survival_counts_to_sbg_data
+
+        weighted = survival_counts_to_sbg_data(FH_TABLE)
+        model = ShiftedBetaGeoModel()  # aggregate=False, but weights present
+        model.build_model(data=weighted)
+
+        assert model.model.named_vars_to_dims["dropout"] == (UNIQUE_DIM,)
+        assert model.aggregation.weights.sum() == 2000
+
+    def test_non_positive_weight_column_rejected(self):
+        from pymc_marketing.clv._aggregation import survival_counts_to_sbg_data
+
+        weighted = survival_counts_to_sbg_data(FH_TABLE)
+        weighted.loc[0, "weight"] = 0.0
+        with pytest.raises(ValueError, match="weight"):
+            ShiftedBetaGeoModel().build_model(data=weighted)
+
+    def test_map_on_survival_table_matches_customer_level(self, cohort_data):
+        """A9: the converter's weighted rows fit like the 2000-customer frame, near F&H."""
+        from pymc_marketing.clv._aggregation import survival_counts_to_sbg_data
+
+        weighted = survival_counts_to_sbg_data(FH_TABLE)
+        table_model = ShiftedBetaGeoModel()
+        table_model.fit(data=weighted, method="map", progressbar=False)
+        customer_model = ShiftedBetaGeoModel()
+        customer_model.fit(data=cohort_data, method="map", progressbar=False)
+
+        for name, published in [("alpha", FH_ALPHA), ("beta", FH_BETA)]:
+            table = table_model.fit_result[name].sel(cohort=["highend", "regular"])
+            customer = customer_model.fit_result[name].sel(
+                cohort=["highend", "regular"]
+            )
+            np.testing.assert_allclose(table, customer, rtol=1e-3)
+            np.testing.assert_allclose(table.squeeze(), published, rtol=0.1)
+
+    def test_low_compression_warns_on_build(self, covariate_data):
+        noisy = covariate_data.assign(noise=np.linspace(0, 1, len(covariate_data)))
+        model = ShiftedBetaGeoModel(
+            model_config={"aggregate": True, "dropout_covariate_cols": ["noise"]}
+        )
+        with pytest.warns(UserWarning, match="compression"):
+            model.build_model(data=noisy)
+
+    @pytest.mark.slow
+    def test_posterior_agrees_within_mcse(self, cohort_data):
+        """A5: independent MCMC fits agree within Monte Carlo error."""
+        import arviz_stats as azs
+
+        plain, agg = self._pair(cohort_data)
+        kwargs = dict(chains=2, draws=400, tune=400, progressbar=False, random_seed=123)
+        plain.fit(data=cohort_data, **kwargs)
+        agg.fit(data=cohort_data, **{**kwargs, "random_seed": 321})
+
+        for name in ("alpha", "beta", "phi", "kappa"):
+            s_plain = azs.summary(plain.idata, var_names=[name])
+            s_agg = azs.summary(agg.idata, var_names=[name])
+            diff = np.abs(s_plain["mean"].to_numpy() - s_agg["mean"].to_numpy())
+            tol = 4 * np.hypot(
+                s_plain["mcse_mean"].to_numpy(), s_agg["mcse_mean"].to_numpy()
+            )
+            assert np.all(diff <= tol), f"{name}: {diff} > {tol}"

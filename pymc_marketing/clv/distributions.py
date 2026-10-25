@@ -874,10 +874,8 @@ class CensoredShiftedBetaGeometric(Discrete):
         alpha = pt.as_tensor_variable(alpha)
         beta = pt.as_tensor_variable(beta)
         T = pt.as_tensor_variable(T)
-        weights = (
-            pt.ones_like(T, dtype="float64")
-            if weights is None
-            else pt.as_tensor_variable(weights, dtype="float64")
+        weights = pt.as_tensor_variable(
+            1.0 if weights is None else weights, dtype="float64"
         )
         return super().dist([alpha, beta, T, weights], *args, **kwargs)
 
