@@ -273,7 +273,8 @@ def run_all(args: argparse.Namespace) -> None:
                     continue
                 samplers = ["nutpie"] + (["pymc"] if n <= args.pymc_sampler_max else [])
                 for sampler in samplers:
-                    path = _result_path(out_dir, arm, n, scenario, sampler)
+                    # absolute: the before arm runs with the worktree as cwd
+                    path = _result_path(out_dir, arm, n, scenario, sampler).resolve()
                     if path.exists() and not args.force:
                         print(f"skip {path.name} (exists)")
                         continue
