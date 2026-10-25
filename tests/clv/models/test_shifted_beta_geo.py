@@ -1195,9 +1195,8 @@ class TestShiftedBetaGeoAggregate:
         agg = model.aggregation
         assert agg.n_unique == 16  # 2 cohorts x 8 recency values
         assert list(model.model.coords[UNIQUE_DIM]) == list(range(16))
-        assert list(model.model.coords["customer_id"]) == list(
-            cohort_data["customer_id"]
-        )
+        assert "customer_id" not in model.model.coords  # ids live on data/aggregation
+        np.testing.assert_array_equal(agg.customer_id, cohort_data["customer_id"])
         assert model.model.named_vars_to_dims["dropout"] == (UNIQUE_DIM,)
         assert model.model.named_vars_to_dims["weights"] == (UNIQUE_DIM,)
         np.testing.assert_array_equal(model.model["weights"].eval(), agg.weights)

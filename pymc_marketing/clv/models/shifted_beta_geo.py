@@ -66,6 +66,9 @@ class ShiftedBetaGeoModel(CLVModel):
           share the same value for ``T``.
         - ``cohort``: Customer cohort label.
         - Any columns listed in ``dropout_covariate_cols`` when using covariates.
+        - ``weight`` (optional): Strictly positive number of customers each row stands
+          for, for data that is already aggregated (for example the output of
+          ``survival_counts_to_sbg_data``). Its presence turns aggregation on.
 
     model_config : dict, optional
         Dictionary of model prior parameters:
@@ -82,6 +85,11 @@ class ShiftedBetaGeoModel(CLVModel):
           ``Prior("Normal", mu=0, sigma=1)``.
         - ``dropout_covariate_cols``: Sequence[str]. Column names for customer-level,
           time-invariant covariates; default ``[]``.
+        - ``aggregate``: bool. Evaluate the likelihood once per unique
+          ``(cohort, recency, T, *dropout_covariate_cols)`` row, weighted by the number
+          of customers sharing it, instead of once per customer; default ``False``.
+          The posterior is identical and the likelihood cost stops growing with the
+          number of customers. See Notes.
     sampler_config : dict, optional
         Dictionary of sampler parameters. Defaults to *None*.
 
@@ -100,6 +108,29 @@ class ShiftedBetaGeoModel(CLVModel):
 
     Notes
     -----
+    **Aggregated likelihood.** With ``aggregate=True`` (or a ``weight`` column) the
+    observed variable ``dropout`` and ``observed_data["dropout"]`` are indexed by a
+    ``unique_obs`` dimension (one entry per unique row) instead of ``customer_id``,
+    and the row counts are stored as ``pm.Data("weights")``. Everything else keeps the
+    ``customer_id`` dimension: ``model.data`` and the ``fit_data`` group stay customer
+    level and every ``expected_*`` method returns one value per customer. In the
+    covariate branch the per-customer ``alpha`` and ``beta`` deterministics are not
+    registered when aggregating; predictions rebuild them from ``alpha_scale``,
+    ``beta_scale`` and the coefficients. ``model.aggregation`` exposes the unique rows,
+    their weights and the inverse map. Customer-level covariates work as long as they
+    are categorical or otherwise repeated across customers; continuous covariates defeat
+    aggregation and trigger a warning.
+
+    **Cross-validation.** Use :meth:`loo` (or :meth:`compute_log_likelihood`) rather
+    than ``az.loo`` on the ``idata``: PyMC stores ``weights * logp`` per unique row, so
+    ``az.loo`` on an aggregated fit is leave-one-*configuration*-out. :meth:`loo`
+    returns the exact customer-level result, comparable across aggregated and
+    customer-level fits in ``az.compare``.
+
+    **Posterior predictive.** ``pm.sample_posterior_predictive`` on an aggregated model
+    draws one ``recency`` per unique row and ignores the weights; it is not a
+    customer-level predictive sample.
+
     Example:
     --------
     Required `data` format:
@@ -142,6 +173,11 @@ class ShiftedBetaGeoModel(CLVModel):
         # Use 'mcmc' for more informative predictions and reliable performance on smaller datasets
         model.fit(data=data,method="mcmc")
         model.fit_summary()
+
+        # Millions of customers: weight unique (cohort, recency, T) rows instead
+        model_large = ShiftedBetaGeoModel(model_config={"aggregate": True})
+        model_large.fit(data=data, method="mcmc")
+        model_large.loo()  # customer-level PSIS-LOO, usable in az.compare
 
         # Predict probability customers are still active
         expected_alive_probability = model.expected_probability_alive(
@@ -342,12 +378,16 @@ class ShiftedBetaGeoModel(CLVModel):
         obs_cohort_idx = pd.Categorical(unique["cohort"], categories=self.cohorts).codes
 
         coords = {
-            "customer_id": self.data["customer_id"],
             "cohort": self.cohorts,
             "dropout_covariate": self.dropout_covariate_cols,
         }
         if aggregated:
+            # No model variable has a customer_id dimension under aggregation, and
+            # PyMC stores coordinates as Python tuples, which does not scale to 10^8
+            # customers. Customer ids stay on ``self.data`` / ``self.aggregation``.
             coords[UNIQUE_DIM] = np.arange(self._aggregation.n_unique)
+        else:
+            coords["customer_id"] = self.data["customer_id"]
 
         with pm.Model(coords=coords) as self.model:
             if self.dropout_covariate_cols:
