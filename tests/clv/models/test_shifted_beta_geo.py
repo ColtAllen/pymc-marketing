@@ -11,8 +11,10 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+import arviz_stats as az
 import numpy as np
 import pandas as pd
+import pymc as pm
 import pytest
 import xarray as xr
 from pymc_extras.prior import Prior
@@ -20,7 +22,7 @@ from pytensor.compile import ViewOp
 from pytensor.tensor.elemwise import Elemwise
 
 from pymc_marketing.clv import ShiftedBetaGeoModel
-from pymc_marketing.clv._aggregation import UNIQUE_DIM
+from pymc_marketing.clv._aggregation import UNIQUE_DIM, expand_to_customers
 from tests.clv.conftest import mock_sample
 
 
@@ -1102,16 +1104,28 @@ def synthetic_covariate_data(n: int = 400, seed: int = 11) -> pd.DataFrame:
     )
 
 
-def mock_posterior(model, draws=20, chains=2, seed=0):
-    """Attach a mocked posterior with every variable the predictive methods read."""
+def mock_posterior(model, draws=20, chains=2, seed=0, spread=0.3):
+    """Attach a mocked posterior with every variable the predictive methods read.
+
+    ``spread`` is the log-scale standard deviation of the alpha/beta draws; keep it small
+    for PSIS-LOO tests so the Pareto k diagnostics stay low.
+    """
     rng = np.random.default_rng(seed)
     cohorts = list(model.cohorts)
     coords = {"chain": np.arange(chains), "draw": np.arange(draws), "cohort": cohorts}
     size = (chains, draws, len(cohorts))
     data = {}
+
+    def lognormal(center):
+        return center * np.exp(spread * rng.normal(size=size))
+
+    alpha, beta = lognormal(0.7), lognormal(2.0)
+    # free RVs of the default hierarchical priors, consistent with alpha/beta
+    data["phi"] = (("chain", "draw", "cohort"), alpha / (alpha + beta))
+    data["kappa"] = (("chain", "draw", "cohort"), alpha + beta)
     if model.dropout_covariate_cols:
-        data["alpha_scale"] = (("chain", "draw", "cohort"), rng.gamma(2, 0.5, size))
-        data["beta_scale"] = (("chain", "draw", "cohort"), rng.gamma(2, 1.0, size))
+        data["alpha_scale"] = (("chain", "draw", "cohort"), alpha)
+        data["beta_scale"] = (("chain", "draw", "cohort"), beta)
         coords["dropout_covariate"] = model.dropout_covariate_cols
         csize = (chains, draws, len(model.dropout_covariate_cols))
         data["dropout_coefficient_alpha"] = (
@@ -1123,8 +1137,8 @@ def mock_posterior(model, draws=20, chains=2, seed=0):
             rng.normal(0, 0.3, csize),
         )
     else:
-        data["alpha"] = (("chain", "draw", "cohort"), rng.gamma(2, 0.5, size))
-        data["beta"] = (("chain", "draw", "cohort"), rng.gamma(2, 1.0, size))
+        data["alpha"] = (("chain", "draw", "cohort"), alpha)
+        data["beta"] = (("chain", "draw", "cohort"), beta)
     posterior = xr.Dataset(data, coords=coords)
     model.idata = xr.DataTree.from_dict({"/posterior": posterior})
     model.set_idata_attrs(model.idata)
@@ -1304,7 +1318,10 @@ class TestShiftedBetaGeoAggregate:
         model.build_model(data=weighted)
 
         assert model.model.named_vars_to_dims["dropout"] == (UNIQUE_DIM,)
-        assert model.aggregation.weights.sum() == 2000
+        assert model.aggregation.total_weight == 2000
+        assert (
+            model.aggregation.compression_ratio == 16 / 2000
+        )  # no low-compression warning
 
     def test_non_positive_weight_column_rejected(self):
         from pymc_marketing.clv._aggregation import survival_counts_to_sbg_data
@@ -1339,6 +1356,87 @@ class TestShiftedBetaGeoAggregate:
         )
         with pytest.warns(UserWarning, match="compression"):
             model.build_model(data=noisy)
+
+    @pytest.mark.parametrize(
+        "dataset, model_config",
+        [
+            ("cohort_data", None),
+            ("covariate_data", {"dropout_covariate_cols": ["channel", "tier"]}),
+        ],
+        ids=["cohorts", "covariates"],
+    )
+    def test_compute_log_likelihood_is_unweighted(self, request, dataset, model_config):
+        """A3: weights x per-row log-likelihood sums to the customer-level total per draw."""
+        data = request.getfixturevalue(dataset)
+        plain, agg = self._pair(data, model_config)
+        mock_posterior(plain, draws=30, seed=2)
+        mock_posterior(agg, draws=30, seed=2)
+
+        ll_plain = plain.compute_log_likelihood()["dropout"]
+        ll_agg = agg.compute_log_likelihood()["dropout"]
+
+        assert ll_plain.dims == ("chain", "draw", "customer_id")
+        assert ll_agg.dims == ("chain", "draw", UNIQUE_DIM)
+        assert "log_likelihood" in plain.idata and "log_likelihood" in agg.idata
+        xr.testing.assert_identical(plain.idata.log_likelihood["dropout"], ll_plain)
+
+        weights = xr.DataArray(agg.aggregation.weights, dims=UNIQUE_DIM)
+        np.testing.assert_allclose(
+            (ll_agg * weights).sum(UNIQUE_DIM), ll_plain.sum("customer_id"), rtol=1e-10
+        )
+        expanded = expand_to_customers(ll_agg, agg.aggregation)
+        np.testing.assert_allclose(expanded.values, ll_plain.values, rtol=1e-10)
+
+        raw = pm.compute_log_likelihood(
+            agg.idata,
+            var_names=["dropout"],
+            model=agg.model,
+            extend_inferencedata=False,
+        )["dropout"]
+        np.testing.assert_allclose(raw.values, (ll_agg * weights).values, rtol=1e-12)
+
+    def test_customer_loo_matches_unaggregated(self, cohort_data):
+        """A4: customer-level LOO from the aggregated fit equals az.loo on the customer graph."""
+        plain, agg = self._pair(cohort_data)
+        mock_posterior(plain, draws=200, chains=2, seed=3, spread=0.05)
+        mock_posterior(agg, draws=200, chains=2, seed=3, spread=0.05)
+
+        plain.compute_log_likelihood()
+        reference = az.loo(plain.idata, var_name="dropout", pointwise=True)
+        got = agg.loo()  # computes the log-likelihood group on demand
+
+        assert got.kind == "loo"
+        assert got.scale == "log"
+        assert got.n_data_points == reference.n_data_points == len(cohort_data)
+        assert got.n_samples == reference.n_samples
+        assert got.good_k == reference.good_k
+        assert got.warning == reference.warning
+        for attr in ("elpd", "se", "p"):
+            np.testing.assert_allclose(
+                getattr(got, attr), getattr(reference, attr), rtol=1e-8
+            )
+        assert got.elpd_i.dims == ("customer_id",)
+        np.testing.assert_array_equal(
+            got.elpd_i["customer_id"], cohort_data["customer_id"]
+        )
+        np.testing.assert_allclose(
+            got.elpd_i.values, reference.elpd_i.values, rtol=1e-8
+        )
+        np.testing.assert_allclose(
+            got.pareto_k.values, reference.pareto_k.values, rtol=1e-8
+        )
+
+        # the result plugs straight into az.compare
+        comparison = az.compare({"customer": reference, "aggregated": got})
+        assert set(comparison.index) == {"customer", "aggregated"}
+        assert comparison["elpd_diff"].abs().max() < 1e-6
+
+        # plain models use az.loo directly; az.loo on the aggregated idata is per configuration
+        np.testing.assert_allclose(plain.loo().elpd, reference.elpd)
+        assert (
+            az.loo(agg.idata, var_name="dropout").n_data_points
+            == agg.aggregation.n_unique
+        )
 
     @pytest.mark.slow
     def test_posterior_agrees_within_mcse(self, cohort_data):

@@ -32,15 +32,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import arviz_stats as az
 import narwhals.stable.v2 as nw
 import numpy as np
 import pandas as pd
 import xarray as xr
+from arviz_stats.utils import ELPDData
 
 __all__ = [
     "UNIQUE_DIM",
     "AggregatedObservations",
     "aggregate_observations",
+    "customer_loo",
     "expand_to_customers",
     "identity_aggregation",
     "survival_counts_to_sbg_data",
@@ -97,9 +100,19 @@ class AggregatedObservations:
         return len(self.customer_id)
 
     @property
+    def total_weight(self) -> float:
+        """Sum of the row weights: the number of customers represented."""
+        return float(self.weights.sum())
+
+    @property
     def compression_ratio(self) -> float:
-        """``n_unique / n_customers``; lower is better."""
-        return self.n_unique / self.n_customers
+        """``n_unique / total_weight``; lower is better.
+
+        Equals ``n_unique / n_customers`` for unweighted input. For pre-aggregated input
+        the denominator is the number of customers the weights stand for, not the number
+        of rows passed in.
+        """
+        return self.n_unique / self.total_weight
 
 
 def _check_columns(schema: nw.Schema, required: Sequence[str]) -> None:
@@ -206,7 +219,7 @@ def aggregate_observations(
     )
     if warn_ratio is not None and agg.compression_ratio > warn_ratio:
         warnings.warn(
-            f"Aggregation keeps {agg.n_unique} of {agg.n_customers} rows "
+            f"Aggregation keeps {agg.n_unique} rows for {agg.total_weight:g} customers "
             f"(compression ratio {agg.compression_ratio:.2f} > {warn_ratio}). "
             "Continuous or high-cardinality key columns defeat aggregation; "
             "consider aggregate=False or coarser covariates.",
@@ -349,3 +362,86 @@ def survival_counts_to_sbg_data(
     result = result[result["weight"] > 0].reset_index(drop=True)
     result.insert(0, "customer_id", np.arange(1, len(result) + 1))
     return result
+
+
+def customer_loo(
+    data: xr.DataTree,
+    agg: AggregatedObservations,
+    var_name: str | None = None,
+    dim: str = UNIQUE_DIM,
+    **loo_kwargs: Any,
+) -> ELPDData:
+    """Customer-level PSIS-LOO from a model fitted on aggregated rows.
+
+    Every customer in unique row ``k`` has the same likelihood ``p(y_k | theta)``, hence
+    the same PSIS importance ratios, ``elpd_loo_i`` and Pareto ``k``. Customer-level LOO
+    is therefore an exact weighted reduction of the row-level result; no
+    ``draws x n_customers`` array is ever built.
+
+    Parameters
+    ----------
+    data : xarray.DataTree
+        Inference data with a ``posterior`` group and a ``log_likelihood`` group whose
+        ``var_name`` variable holds the **unweighted** per-row log-likelihood over ``dim``.
+    agg : AggregatedObservations
+        The aggregation the model was built with.
+    var_name : str, optional
+        Log-likelihood variable; required when the group holds several.
+    dim : str
+        Row dimension of the log-likelihood (default :data:`UNIQUE_DIM`).
+    **loo_kwargs
+        Forwarded to :func:`arviz_stats.loo` (for example ``reff``).
+
+    Returns
+    -------
+    arviz_stats.utils.ELPDData
+        ``elpd``, ``se``, ``p`` and ``n_data_points`` refer to customers; ``elpd_i`` and
+        ``pareto_k`` have a ``customer_id`` dimension. The object works directly in
+        :func:`arviz_stats.compare`.
+    """
+    loo_kwargs.pop("pointwise", None)
+    rows = az.loo(data, var_name=var_name, pointwise=True, **loo_kwargs)
+    if rows.elpd_i.dims != (dim,):
+        raise ValueError(
+            f"Expected pointwise results over {dim!r}, got dims {rows.elpd_i.dims}."
+        )
+    if rows.elpd_i.sizes[dim] != agg.n_unique:
+        raise ValueError(
+            f"log-likelihood has {rows.elpd_i.sizes[dim]} rows, aggregation has {agg.n_unique}."
+        )
+
+    log_lik_ds = data["log_likelihood"].to_dataset()
+    if var_name is None:
+        var_name = next(iter(log_lik_ds.data_vars))
+    log_lik = log_lik_ds[var_name]
+    sample = log_lik.stack(__sample__=("chain", "draw"))
+    shift = sample.max("__sample__")
+    lppd_i = shift + np.log(np.exp(sample - shift).mean("__sample__"))
+
+    weights = xr.DataArray(agg.weights, dims=dim)
+    n_customers = float(weights.sum())
+    elpd = float((weights * rows.elpd_i).sum())
+    mean = elpd / n_customers
+    se = float(np.sqrt((weights * (rows.elpd_i - mean) ** 2).sum()))
+    p_loo = float((weights * (lppd_i - rows.elpd_i)).sum())
+    n_data_points = (
+        round(n_customers)
+        if np.isclose(n_customers, round(n_customers))
+        else n_customers
+    )
+
+    return ELPDData(
+        kind="loo",
+        elpd=elpd,
+        se=se,
+        p=p_loo,
+        n_samples=rows.n_samples,
+        n_data_points=n_data_points,
+        scale="log",
+        warning=rows.warning,
+        good_k=rows.good_k,
+        elpd_i=expand_to_customers(rows.elpd_i, agg, dim=dim).rename("elpd_i"),
+        pareto_k=expand_to_customers(rows.pareto_k, agg, dim=dim).rename("pareto_k"),
+        approx_posterior=False,
+        log_weights=rows.log_weights,
+    )

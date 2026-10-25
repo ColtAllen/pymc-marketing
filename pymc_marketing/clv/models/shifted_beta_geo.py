@@ -15,10 +15,12 @@
 
 from collections.abc import Sequence
 
+import arviz_stats as az
 import numpy as np
 import pandas as pd
 import pymc as pm
 import xarray
+from arviz_stats.utils import ELPDData
 from pymc_extras.prior import Prior
 from scipy.special import gammaln, hyp2f1
 
@@ -26,6 +28,7 @@ from pymc_marketing.clv._aggregation import (
     UNIQUE_DIM,
     AggregatedObservations,
     aggregate_observations,
+    customer_loo,
     identity_aggregation,
 )
 from pymc_marketing.clv.distributions import CensoredShiftedBetaGeometric
@@ -438,6 +441,78 @@ class ShiftedBetaGeoModel(CLVModel):
             observed=unique["recency"].to_numpy(),
             dims=obs_dim,
         )
+
+    @property
+    def _is_aggregated(self) -> bool:
+        return UNIQUE_DIM in self.model.coords
+
+    def compute_log_likelihood(self, **kwargs) -> xarray.Dataset:
+        """Compute the per-row log-likelihood and store it in ``idata.log_likelihood``.
+
+        With ``aggregate=False`` this is :func:`pymc.compute_log_likelihood` over
+        ``customer_id``. Under aggregation, PyMC returns ``weights * logp`` per unique
+        row, which is wrong for cross-validation; the stored value is divided by the
+        row weights so it is the log-likelihood of **one** customer of that row, with
+        dims ``(chain, draw, unique_obs)``. Use :meth:`loo` for customer-level LOO.
+
+        Parameters
+        ----------
+        **kwargs
+            Forwarded to :func:`pymc.compute_log_likelihood` (for example
+            ``progressbar``).
+
+        Returns
+        -------
+        xarray.Dataset
+            The ``log_likelihood`` group.
+        """
+        if self.idata is None or "posterior" not in self.idata:
+            raise RuntimeError("The model hasn't been fit yet, call .fit() first")
+        kwargs.setdefault("progressbar", False)
+        log_lik = pm.compute_log_likelihood(
+            self.idata,
+            var_names=["dropout"],
+            model=self.model,
+            extend_inferencedata=False,
+            **kwargs,
+        )
+        if isinstance(log_lik, xarray.DataTree):
+            log_lik = log_lik["log_likelihood"].to_dataset()
+        if self._is_aggregated:
+            weights = xarray.DataArray(self.aggregation.weights, dims=UNIQUE_DIM)
+            log_lik = log_lik.assign(dropout=log_lik["dropout"] / weights)
+        if "log_likelihood" in self.idata:
+            del self.idata["log_likelihood"]
+        self.idata["log_likelihood"] = xarray.DataTree(log_lik)
+        return log_lik
+
+    def loo(self, **loo_kwargs) -> ELPDData:
+        """Customer-level PSIS-LOO cross-validation.
+
+        Computes :meth:`compute_log_likelihood` first when the ``log_likelihood`` group
+        is missing. For aggregated models the row-level result is reduced exactly to
+        the customer level with the row weights, so the output is comparable with
+        ``az.loo`` on a customer-level fit (and with other models in
+        :func:`arviz_stats.compare`). Calling ``az.loo`` directly on an aggregated
+        model's ``idata`` gives leave-one-*configuration*-out instead.
+
+        Parameters
+        ----------
+        **loo_kwargs
+            Forwarded to :func:`arviz_stats.loo`.
+
+        Returns
+        -------
+        arviz_stats.utils.ELPDData
+        """
+        if self.idata is None or "log_likelihood" not in self.idata:
+            self.compute_log_likelihood()
+        if self._is_aggregated:
+            return customer_loo(
+                self.idata, self.aggregation, var_name="dropout", **loo_kwargs
+            )
+        loo_kwargs.setdefault("pointwise", True)
+        return az.loo(self.idata, var_name="dropout", **loo_kwargs)
 
     def _extract_predictive_variables(
         self,

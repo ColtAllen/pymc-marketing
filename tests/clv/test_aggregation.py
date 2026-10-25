@@ -114,16 +114,15 @@ class TestAggregateObservations:
         pre.loc[0, "weight"] -= 2.5
         pre = pd.concat([pre, extra], ignore_index=True)
 
-        agg = aggregate_observations(
-            to_backend(pre), KEY_COLS, weight_col="weight", warn_ratio=None
-        )
+        agg = aggregate_observations(to_backend(pre), KEY_COLS, weight_col="weight")
 
         pd.testing.assert_frame_equal(
             agg.unique.reset_index(drop=True).astype(plain.unique.dtypes.to_dict()),
             plain.unique.reset_index(drop=True),
             check_dtype=False,
         )
-        assert agg.weights.sum() == pytest.approx(len(customer_data))
+        assert agg.total_weight == pytest.approx(len(customer_data))
+        assert agg.compression_ratio == pytest.approx(plain.compression_ratio)
 
     def test_null_key_rejected(self, customer_data):
         bad = customer_data.copy()
@@ -235,9 +234,7 @@ class TestSurvivalCountsConverter:
 
         customer_level = pd.read_csv("data/sbg_cohorts.csv")
         expected = aggregate_observations(customer_level, KEY_COLS).unique
-        got = aggregate_observations(
-            converted, KEY_COLS, weight_col="weight", warn_ratio=None
-        ).unique
+        got = aggregate_observations(converted, KEY_COLS, weight_col="weight").unique
 
         pd.testing.assert_frame_equal(
             got.reset_index(drop=True).astype(expected.dtypes.to_dict()),
