@@ -15,11 +15,14 @@
 
 import warnings
 from collections.abc import Sequence
+from typing import Literal
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 import numpy as np
 import pandas as pd
 import pymc as pm
+import seaborn as sns
 from arviz_stats.ecdf_utils import (
     compute_ecdf,
     get_pointwise_confidence_band,
@@ -28,9 +31,13 @@ from arviz_stats.ecdf_utils import (
 from matplotlib.lines import Line2D
 
 from pymc_marketing.clv import BetaGeoModel, ParetoNBDModel
-from pymc_marketing.clv.utils import _expected_cumulative_transactions
+from pymc_marketing.clv.utils import (
+    _expected_cumulative_transactions,
+    _find_first_transactions,
+)
 
 __all__ = [
+    "plot_cohorts",
     "plot_customer_exposure",
     "plot_expected_purchases_over_time",
     "plot_expected_purchases_ppc",
@@ -50,6 +57,11 @@ _MIN_PPC_RATIO = 20
 # linear in the draws while the coverage above saturates well before this: at 20k customers a ratio
 # of 1000 costs 646 MB and 171 s, against 38 MB and 9 s at 50, for no measurable gain.
 _REFERENCE_DRAWS = 100
+
+# Cell count above which per-cell annotations on a cohort heatmap become unreadable, so they
+# are suppressed unless the caller asks for them explicitly. A daily transaction log easily
+# produces hundreds of cohorts by hundreds of periods.
+_MAX_ANNOT_CELLS = 200
 
 
 def plot_customer_exposure(
@@ -169,6 +181,342 @@ def plot_customer_exposure(
     ]
 
     ax.legend(handles=legend_elements, loc="best")
+
+    return ax
+
+
+def _cohorts_from_transactions(
+    data: pd.DataFrame,
+    customer_id_col: str,
+    datetime_col: str,
+    time_unit: str,
+    datetime_format: str | None,
+    sort_transactions: bool | None,
+) -> pd.DataFrame:
+    """Derive customer-level cohort labels and activity ages from a transaction log.
+
+    A customer's cohort is the period of their first transaction, and their *age of last
+    activity* is the number of periods between that and their final transaction.
+    """
+    transactions = _find_first_transactions(
+        data,
+        customer_id_col,
+        datetime_col,
+        datetime_format=datetime_format,
+        time_unit=time_unit,
+        sort_transactions=sort_transactions,
+    )
+
+    spans = transactions.groupby(customer_id_col)[datetime_col].agg(["min", "max"])
+    cohort_ordinal = np.asarray(pd.PeriodIndex(spans["min"]).astype("int64"))
+    last_ordinal = np.asarray(pd.PeriodIndex(spans["max"]).astype("int64"))
+    observation_end = pd.PeriodIndex(transactions[datetime_col]).max()
+
+    return pd.DataFrame(
+        {
+            "cohort": spans["min"].to_numpy(),
+            "age_last": last_ordinal - cohort_ordinal,
+            "n_ages": observation_end.ordinal - cohort_ordinal,
+        }
+    )
+
+
+def _cohorts_from_summary(data: pd.DataFrame, cohort_col: str | None) -> pd.DataFrame:
+    """Derive customer-level cohort labels and activity ages from a summary DataFrame.
+
+    *recency* is taken as the age of last activity. When no cohort column is available the
+    acquisition cohort is recovered from *T*: a larger *T* means an earlier acquisition.
+    """
+    missing = [col for col in ("recency", "T") if col not in data.columns]
+    if missing:
+        raise ValueError(
+            f"Summary data must contain 'recency' and 'T' columns; missing {missing}. "
+            "Pass 'datetime_col' to supply a raw transaction log instead."
+        )
+
+    if cohort_col is None and "cohort" in data.columns:
+        cohort_col = "cohort"
+
+    if cohort_col is not None:
+        if cohort_col not in data.columns:
+            raise ValueError(f"'{cohort_col}' is not a column of the provided data.")
+        labels = data[cohort_col].to_numpy()
+    else:
+        T = data["T"].to_numpy(dtype=float)
+        labels = np.rint(T.max() - T).astype(np.int64)
+        if len(np.unique(labels)) == 1:
+            warnings.warn(
+                "All customers share the same 'T', so they collapse into a single cohort. "
+                "Supply 'cohort_col' to group customers explicitly.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    return pd.DataFrame(
+        {
+            "cohort": labels,
+            "age_last": data["recency"].to_numpy(),
+            "n_ages": data["T"].to_numpy(),
+        }
+    )
+
+
+def _cohort_retention_table(customers: pd.DataFrame, show_pct: bool) -> pd.DataFrame:
+    """Count customers still active at each cohort age, one row per cohort and age."""
+    frames = []
+
+    for label, group in customers.groupby("cohort", sort=True):
+        n_ages = int(np.floor(group["n_ages"].max()))
+        if n_ages < 1:
+            continue
+        ages = np.arange(n_ages)
+        # A customer is retained at age ``a`` when their last observed activity falls
+        # strictly after it, which makes the resulting curve non-increasing in age.
+        surviving = (group["age_last"].to_numpy()[:, None] > ages[None, :]).sum(axis=0)
+        value = 100 * surviving / len(group) if show_pct else surviving
+        frames.append(
+            pd.DataFrame({"cohort": label, "cohort_age": ages, "value": value})
+        )
+
+    if not frames:
+        raise ValueError(
+            "No cohort has a full period of follow-up, so there is nothing to plot."
+        )
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def _cohort_periods(labels: pd.Series, time_unit: str) -> dict | None:
+    """Map cohort labels onto periods, or return ``None`` when they are not dates."""
+    unique = pd.Index(pd.unique(labels))
+
+    if isinstance(unique, pd.PeriodIndex):
+        return {label: label for label in unique}
+    if unique.dtype.kind in "iuf":
+        return None
+
+    try:
+        with warnings.catch_warnings():
+            # Mixed or unusual label formats warn about falling back to dateutil; the
+            # except branch below already handles labels that are not dates at all.
+            warnings.simplefilter("ignore", UserWarning)
+            periods = pd.to_datetime(unique).to_period(time_unit)
+    except (ValueError, TypeError):
+        return None
+
+    return dict(zip(unique, periods, strict=True))
+
+
+def _warn_on_cohort_spacing(period_map: dict) -> None:
+    """Warn when *time_unit* is finer than the spacing between consecutive cohorts."""
+    periods = pd.PeriodIndex(sorted(set(period_map.values())))
+    if len(periods) < 2:
+        return
+
+    step = np.diff(np.asarray(periods.astype("int64"))).min()
+    if step > 1:
+        warnings.warn(
+            f"Consecutive cohorts are {step} '{periods.freqstr}' periods apart. 'time_unit' "
+            "likely does not match the cohort spacing, which will stretch the calendar axis.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def plot_cohorts(
+    data: pd.DataFrame,
+    *,
+    cohort_col: str | None = None,
+    customer_id_col: str = "customer_id",
+    datetime_col: str | None = None,
+    time_unit: str = "D",
+    datetime_format: str | None = None,
+    sort_transactions: bool | None = True,
+    show_pct: bool = False,
+    x_axis: Literal["auto", "calendar", "cohort_age"] = "auto",
+    annot: bool | None = None,
+    title: str | None = None,
+    xlabel: str | None = None,
+    ylabel: str = "Cohort",
+    ax: plt.Axes | None = None,
+    **kwargs,
+) -> plt.Axes:
+    """Plot observed cohort retention as a heatmap.
+
+    Each row is a cohort and each column a point in time, with cells reporting how many of
+    that cohort were still active. This is a description of the observed data only; no model
+    is fitted or consulted, so it accepts the data shapes used by every CLV transaction
+    model.
+
+    Data can be supplied in either of two forms:
+
+    * a **summary DataFrame** with *recency* and *T*, as consumed by ``BetaGeoModel``,
+      ``ModifiedBetaGeoModel``, ``ParetoNBDModel``, ``BetaGeoBetaBinomModel`` and
+      ``ShiftedBetaGeoModel``;
+    * a **raw transaction log**, by passing *datetime_col*.
+
+    A customer counts as retained at cohort age ``a`` when their last observed activity falls
+    strictly after ``a``. Note what this means for the first column, because it differs by
+    model family. ``ShiftedBetaGeoModel`` records *recency* as the one-indexed period of the
+    last contract renewal, so *recency* is always at least 1 and age 0 is 100% by
+    construction. In RFM data *recency* is elapsed time since the first purchase, which is 0
+    for one-time buyers, so age 0 sits below 100% and reads as the repeat-purchase rate.
+    Percentages are always relative to the full cohort size.
+
+    Parameters
+    ----------
+    data : ~pandas.DataFrame
+        Either a summary DataFrame containing *recency* and *T*, or a raw transaction log
+        containing *customer_id_col* and *datetime_col*.
+    cohort_col : str, optional
+        Column holding the cohort label. Defaults to ``"cohort"`` when that column is
+        present. If neither is available the acquisition cohort is derived from *T*, since a
+        larger *T* implies an earlier acquisition. Ignored when *datetime_col* is given.
+    customer_id_col : str, optional
+        Column denoting the customer ID. Only used for a transaction log. Default:
+        ``"customer_id"``.
+    datetime_col : str, optional
+        Column denoting the transaction datetimes. Supplying it switches *data* from summary
+        to transaction-log interpretation.
+    time_unit : str, optional
+        Length of one time period, both for resampling a transaction log and for advancing
+        the calendar axis. Default: ``'D'`` for days. Possible values listed here:
+        https://numpy.org/devdocs/reference/arrays.datetime.html#datetime-units
+    datetime_format : str, optional
+        A string that represents the timestamp format. Useful if Pandas doesn't recognize
+        the provided format.
+    sort_transactions : bool, optional
+        Default: *True*. If a transaction log is already sorted in chronological order, set
+        to *False* to improve computational efficiency.
+    show_pct : bool, optional
+        Default: *False*. Show retention as a percentage of the cohort's starting size rather
+        than as raw customer counts.
+    x_axis : str, optional
+        ``'calendar'`` places cohorts on a shared absolute timeline, giving the familiar
+        upper-triangular chart. ``'cohort_age'`` indexes columns by periods since the cohort
+        started, giving a rectangular chart, and is the only option when cohort labels are
+        not dates. Default: ``'auto'``, which uses ``'calendar'`` where the labels permit it.
+    annot : bool, optional
+        Write the value into each cell. Defaults to *True* for small matrices and *False*
+        beyond 200 cells, where the annotations stop being readable.
+    title : str, optional
+        Figure title
+    xlabel : str, optional
+        Figure xlabel
+    ylabel : str, optional
+        Figure ylabel
+    ax : matplotlib.Axes, optional
+        A matplotlib Axes instance. Creates new axes instance by default.
+    kwargs
+        Passed into the seaborn.heatmap command.
+
+    Returns
+    -------
+    axes : matplotlib.AxesSubplot
+
+    Raises
+    ------
+    ValueError
+        If *x_axis* is not a recognized option, if ``'calendar'`` is requested for cohort
+        labels that are not dates, if a summary DataFrame lacks *recency* or *T*, or if no
+        cohort has a full period of follow-up.
+
+    Examples
+    --------
+    Retention percentages from a summary DataFrame:
+
+    .. code-block:: python
+
+        from pymc_marketing.clv import plot_cohorts
+
+        plot_cohorts(rfm_data, show_pct=True)
+
+    A monthly cohort chart built straight from a transaction log:
+
+    .. code-block:: python
+
+        plot_cohorts(
+            transactions,
+            customer_id_col="id",
+            datetime_col="date",
+            time_unit="M",
+        )
+
+    """
+    if x_axis not in ("auto", "calendar", "cohort_age"):
+        raise ValueError("'x_axis' must be one of 'auto', 'calendar' or 'cohort_age'.")
+
+    if datetime_col is not None:
+        customers = _cohorts_from_transactions(
+            data,
+            customer_id_col,
+            datetime_col,
+            time_unit,
+            datetime_format,
+            sort_transactions,
+        )
+    else:
+        customers = _cohorts_from_summary(data, cohort_col)
+
+    table = _cohort_retention_table(customers, show_pct)
+    period_map = _cohort_periods(table["cohort"], time_unit)
+
+    if period_map is None:
+        if x_axis == "calendar":
+            raise ValueError(
+                "Cohort labels could not be interpreted as dates, so 'calendar' is not "
+                "available for 'x_axis'. Use 'cohort_age' instead."
+            )
+        use_calendar = False
+    else:
+        use_calendar = x_axis != "cohort_age"
+
+    if period_map is not None and use_calendar:
+        starts = table["cohort"].map(period_map)
+        columns = pd.PeriodIndex(
+            [
+                start + age
+                for start, age in zip(starts, table["cohort_age"], strict=True)
+            ]
+        )
+        table = table.assign(column=columns.astype(str))
+        _warn_on_cohort_spacing(period_map)
+    else:
+        table = table.assign(column=table["cohort_age"])
+
+    pivot = table.pivot(index="cohort", columns="column", values="value")
+    pivot = pivot.sort_index()[sorted(pivot.columns)]
+
+    if annot is None:
+        annot = pivot.size <= _MAX_ANNOT_CELLS
+
+    if ax is None:
+        ax = plt.subplot(111)
+
+    if show_pct:
+        fmt = ".0f"
+        cbar_format = mtick.FuncFormatter(lambda y, _: f"{y:.0f}%")
+        default_title = "Cohort Retention Rate (%)"
+    else:
+        fmt = ",.0f"
+        cbar_format = mtick.FuncFormatter(lambda y, _: f"{y:,.0f}")
+        default_title = "Cohort Customer Counts"
+
+    kwargs.setdefault("cmap", "viridis_r")
+    kwargs.setdefault("linewidths", 0.2)
+    kwargs.setdefault("linecolor", "black")
+    kwargs.setdefault("cbar_kws", {"format": cbar_format})
+
+    sns.heatmap(pivot, annot=annot, fmt=fmt, ax=ax, **kwargs)
+
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+    ax.set(
+        title=default_title if title is None else title,
+        xlabel=("Time Period" if use_calendar else "Cohort Age")
+        if xlabel is None
+        else xlabel,
+        ylabel=ylabel,
+    )
 
     return ax
 

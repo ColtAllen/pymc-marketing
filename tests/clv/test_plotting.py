@@ -21,6 +21,7 @@ import xarray as xr
 from pytensor.tensor import TensorVariable
 
 from pymc_marketing.clv import (
+    plot_cohorts,
     plot_customer_exposure,
     plot_expected_purchases_over_time,
     plot_expected_purchases_ppc,
@@ -341,3 +342,223 @@ def test_plot_expected_purchases_ppc_ecdf_ignores_max_purchases(fitted_model):
         )
 
     plt.close("all")
+
+
+@pytest.fixture(scope="module")
+def sbg_cohort_data() -> pd.DataFrame:
+    """Contractual sBG data whose cohort labels are segments, not dates."""
+    return pd.read_csv("data/sbg_cohorts.csv")
+
+
+@pytest.fixture
+def dated_cohort_data() -> pd.DataFrame:
+    """Summary data with staggered monthly cohorts, as produced by an sBG study."""
+    rng = np.random.default_rng(42)
+    frames = []
+    for offset, cohort in enumerate(["2025-01", "2025-02", "2025-03"]):
+        T = 6 - offset
+        frames.append(
+            pd.DataFrame(
+                {
+                    "customer_id": range(offset * 100, (offset + 1) * 100),
+                    "cohort": cohort,
+                    "recency": rng.integers(1, T + 1, 100),
+                    "T": T,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_plot_cohorts_retention_values_are_exact():
+    # last activity at ages 0, 1, 1 and 3 within a single four-period cohort
+    data = pd.DataFrame(
+        {
+            "customer_id": [1, 2, 3, 4],
+            "cohort": ["A"] * 4,
+            "recency": [0, 1, 1, 3],
+            "T": [4] * 4,
+        }
+    )
+
+    ax = plot_cohorts(data)
+
+    # retained at age a == customers whose last activity falls strictly after a
+    assert [text.get_text() for text in ax.texts] == ["3", "1", "1", "0"]
+
+    plt.close("all")
+
+
+@pytest.mark.parametrize("show_pct", [False, True])
+def test_plot_cohorts_summary_data(sbg_cohort_data, show_pct) -> None:
+    ax = plot_cohorts(sbg_cohort_data, show_pct=show_pct)
+
+    assert isinstance(ax, plt.Axes)
+    # 'highend' and 'regular' are not dates, so the calendar axis is unavailable
+    assert ax.get_xlabel() == "Cohort Age"
+    assert ax.get_ylabel() == "Cohort"
+    expected_title = (
+        "Cohort Retention Rate (%)" if show_pct else "Cohort Customer Counts"
+    )
+    assert ax.get_title() == expected_title
+
+    plt.close("all")
+
+
+def test_plot_cohorts_sbg_retention_starts_at_full_cohort(sbg_cohort_data) -> None:
+    """sBG *recency* is one-indexed, so no customer has churned by age 0."""
+    ax = plot_cohorts(sbg_cohort_data, show_pct=True)
+
+    first_column = [text.get_text() for text in ax.texts][::8]
+
+    assert first_column == ["100", "100"]
+
+    plt.close("all")
+
+
+def test_plot_cohorts_derives_cohorts_from_T(test_summary_data) -> None:
+    ax = plot_cohorts(test_summary_data)
+
+    assert isinstance(ax, plt.Axes)
+    # a larger T means an earlier acquisition, so cohorts are integer offsets
+    assert ax.get_xlabel() == "Cohort Age"
+    assert len(ax.get_yticklabels()) > 1
+
+    plt.close("all")
+
+
+def test_plot_cohorts_warns_on_homogeneous_T() -> None:
+    data = pd.DataFrame(
+        {"customer_id": [1, 2, 3], "recency": [0, 1, 2], "T": [3, 3, 3]}
+    )
+
+    with pytest.warns(UserWarning, match=r"same 'T'"):
+        ax = plot_cohorts(data)
+
+    assert len(ax.get_yticklabels()) == 1
+
+    plt.close("all")
+
+
+@pytest.mark.parametrize("x_axis", ["auto", "calendar", "cohort_age"])
+def test_plot_cohorts_dated_cohorts(dated_cohort_data, x_axis) -> None:
+    ax = plot_cohorts(dated_cohort_data, time_unit="M", x_axis=x_axis, show_pct=True)
+
+    columns = [text.get_text() for text in ax.get_xticklabels()]
+
+    if x_axis == "cohort_age":
+        assert ax.get_xlabel() == "Cohort Age"
+        assert columns == ["0", "1", "2", "3", "4", "5"]
+    else:
+        # cohorts are staggered onto a shared calendar, spanning 2025-01 to 2025-06
+        assert ax.get_xlabel() == "Time Period"
+        assert columns == [f"2025-0{month}" for month in range(1, 7)]
+
+    plt.close("all")
+
+
+def test_plot_cohorts_warns_when_time_unit_misses_cohort_spacing(
+    dated_cohort_data,
+) -> None:
+    with pytest.warns(UserWarning, match=r"'time_unit' likely does not match"):
+        plot_cohorts(dated_cohort_data, time_unit="D")
+
+    plt.close("all")
+
+
+@pytest.mark.parametrize("time_unit", ["W", "M"])
+def test_plot_cohorts_transaction_log(cdnow_trans, time_unit) -> None:
+    ax = plot_cohorts(
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit=time_unit,
+    )
+
+    cohorts = [text.get_text() for text in ax.get_yticklabels()]
+
+    assert isinstance(ax, plt.Axes)
+    assert ax.get_xlabel() == "Time Period"
+    # CDNOW customers were all acquired in the first quarter of 1997
+    assert all(label.startswith(("1996-12", "1997-0")) for label in cohorts)
+    if time_unit == "M":
+        assert cohorts == ["1997-01", "1997-02", "1997-03"]
+    else:
+        assert len(cohorts) > 3
+
+    plt.close("all")
+
+
+def test_plot_cohorts_retention_is_non_increasing(cdnow_trans) -> None:
+    ax = plot_cohorts(
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit="M",
+        show_pct=True,
+    )
+
+    values = ax.collections[0].get_array().reshape(3, -1)
+
+    for cohort in np.ma.filled(values, np.nan):
+        observed = cohort[~np.isnan(cohort)]
+        assert np.all(np.diff(observed) <= 0)
+
+    plt.close("all")
+
+
+def test_plot_cohorts_annotates_small_matrices_only(cdnow_trans, sbg_cohort_data):
+    small = plot_cohorts(sbg_cohort_data)
+    assert len(small.texts) == 16
+    plt.close("all")
+
+    large = plot_cohorts(
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit="W",
+    )
+    assert len(large.texts) == 0
+    plt.close("all")
+
+    forced = plot_cohorts(
+        cdnow_trans,
+        customer_id_col="id",
+        datetime_col="date",
+        datetime_format="%Y%m%d",
+        time_unit="W",
+        annot=True,
+    )
+    assert len(forced.texts) > 0
+    plt.close("all")
+
+
+def test_plot_cohorts_with_ax(sbg_cohort_data) -> None:
+    ax = plt.subplot()
+
+    assert plot_cohorts(sbg_cohort_data, ax=ax, title="Custom", ylabel="Segment") is ax
+    assert ax.get_title() == "Custom"
+    assert ax.get_ylabel() == "Segment"
+
+    plt.close("all")
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"x_axis": "quarterly"}, r"'x_axis' must be one of"),
+        ({"x_axis": "calendar"}, r"could not be interpreted as dates"),
+        ({"cohort_col": "segment"}, r"not a column of the provided data"),
+    ],
+)
+def test_plot_cohorts_invalid_arguments(sbg_cohort_data, kwargs, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        plot_cohorts(sbg_cohort_data, **kwargs)
+
+
+def test_plot_cohorts_requires_summary_columns() -> None:
+    with pytest.raises(ValueError, match=r"missing \['recency', 'T'\]"):
+        plot_cohorts(pd.DataFrame({"customer_id": [1, 2]}))
