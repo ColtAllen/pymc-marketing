@@ -26,6 +26,7 @@ from scipy.special import gammaln, hyp2f1
 
 from pymc_marketing.clv._aggregation import (
     UNIQUE_DIM,
+    UNWEIGHTED_ATTR,
     AggregatedObservations,
     aggregate_observations,
     customer_loo,
@@ -342,10 +343,6 @@ class ShiftedBetaGeoModel(CLVModel):
             raise ValueError("recency cannot be greater than T")
         if (data["T"] < 2).any():
             raise ValueError("Column T must be at least 2")
-        if "weight" in data.columns:
-            weight = data["weight"].to_numpy(dtype="float64")
-            if not np.all(np.isfinite(weight)) or np.any(weight <= 0):
-                raise ValueError("Column weight must be finite and strictly positive")
 
         self._validate_cohorts(data, check_param_dims=("alpha", "beta"))
 
@@ -373,6 +370,7 @@ class ShiftedBetaGeoModel(CLVModel):
         self._validate_data(data)
         self.data = data
         self._aggregation, obs_dim = self._aggregate(data)
+        self._obs_dim = obs_dim
         aggregated = obs_dim == UNIQUE_DIM
         unique = self._aggregation.unique
         obs_cohort_idx = pd.Categorical(unique["cohort"], categories=self.cohorts).codes
@@ -484,7 +482,7 @@ class ShiftedBetaGeoModel(CLVModel):
 
     @property
     def _is_aggregated(self) -> bool:
-        return UNIQUE_DIM in self.model.coords
+        return getattr(self, "_obs_dim", "customer_id") == UNIQUE_DIM
 
     def compute_log_likelihood(self, **kwargs) -> xarray.Dataset:
         """Compute the per-row log-likelihood and store it in ``idata.log_likelihood``.
@@ -521,6 +519,9 @@ class ShiftedBetaGeoModel(CLVModel):
         if self._is_aggregated:
             weights = xarray.DataArray(self.aggregation.weights, dims=UNIQUE_DIM)
             log_lik = log_lik.assign(dropout=log_lik["dropout"] / weights)
+        # Marks the group as per-customer; a group PyMC wrote itself (for example via
+        # ``idata_kwargs={"log_likelihood": True}``) is ``weights * logp`` and lacks it.
+        log_lik.attrs[UNWEIGHTED_ATTR] = "true"
         if "log_likelihood" in self.idata:
             del self.idata["log_likelihood"]
         self.idata["log_likelihood"] = xarray.DataTree(log_lik)
@@ -545,7 +546,11 @@ class ShiftedBetaGeoModel(CLVModel):
         -------
         arviz_stats.utils.ELPDData
         """
-        if self.idata is None or "log_likelihood" not in self.idata:
+        if (
+            self.idata is None
+            or "log_likelihood" not in self.idata
+            or UNWEIGHTED_ATTR not in self.idata["log_likelihood"].attrs
+        ):
             self.compute_log_likelihood()
         if self._is_aggregated:
             return customer_loo(
