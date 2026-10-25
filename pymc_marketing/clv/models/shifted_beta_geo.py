@@ -22,7 +22,13 @@ import xarray
 from pymc_extras.prior import Prior
 from scipy.special import gammaln, hyp2f1
 
-from pymc_marketing.clv.distributions import ShiftedBetaGeometric
+from pymc_marketing.clv._aggregation import (
+    UNIQUE_DIM,
+    AggregatedObservations,
+    aggregate_observations,
+    identity_aggregation,
+)
+from pymc_marketing.clv.distributions import CensoredShiftedBetaGeometric
 from pymc_marketing.clv.models import CLVModel
 from pymc_marketing.clv.utils import to_xarray
 from pymc_marketing.model_config import ModelConfig
@@ -237,6 +243,7 @@ class ShiftedBetaGeoModel(CLVModel):
             "kappa": Prior("Pareto", alpha=1, m=1, dims="cohort"),
             "dropout_coefficient": Prior("Normal", mu=0, sigma=1),
             "dropout_covariate_cols": [],
+            "aggregate": False,
         }
 
     @property
@@ -262,6 +269,20 @@ class ShiftedBetaGeoModel(CLVModel):
             )
         return pd.Categorical(self.data["cohort"], categories=self.cohorts).codes
 
+    @property
+    def aggregation(self) -> AggregatedObservations:
+        """Likelihood rows, their weights and the map back to customers.
+
+        With ``aggregate=False`` and no ``weight`` column every customer is its own row
+        with weight ``1``. Otherwise rows are the unique ``(cohort, recency, T, *covariates)``
+        combinations and ``weights`` counts the customers (or sums ``weight``) in each.
+        """
+        if getattr(self, "_aggregation", None) is None:
+            raise AttributeError(
+                "aggregation not available. Call build_model(data=...) first."
+            )
+        return self._aggregation
+
     def _validate_data(self, data: pd.DataFrame) -> None:
         """Validate Shifted Beta-Geometric-specific data requirements."""
         self._validate_cols(
@@ -282,8 +303,24 @@ class ShiftedBetaGeoModel(CLVModel):
             raise ValueError("recency cannot be greater than T")
         if (data["T"] < 2).any():
             raise ValueError("Column T must be at least 2")
+        if "weight" in data.columns:
+            weight = data["weight"].to_numpy(dtype="float64")
+            if not np.all(np.isfinite(weight)) or np.any(weight <= 0):
+                raise ValueError("Column weight must be finite and strictly positive")
 
         self._validate_cohorts(data, check_param_dims=("alpha", "beta"))
+
+    def _aggregate(self, data: pd.DataFrame) -> tuple[AggregatedObservations, str]:
+        """Choose the likelihood rows and their dimension name.
+
+        Aggregation is used when ``model_config["aggregate"]`` is set or when ``data``
+        carries a ``weight`` column (already aggregated input).
+        """
+        key_cols = ("cohort", "recency", "T", *self.dropout_covariate_cols)
+        weight_col = "weight" if "weight" in data.columns else None
+        if self.model_config["aggregate"] or weight_col is not None:
+            return aggregate_observations(data, key_cols, weight_col), UNIQUE_DIM
+        return identity_aggregation(data, key_cols), "customer_id"
 
     def build_model(self, data: pd.DataFrame) -> None:  # type: ignore[override]
         """Build the model.
@@ -291,23 +328,31 @@ class ShiftedBetaGeoModel(CLVModel):
         Parameters
         ----------
         data : pd.DataFrame
-            Input data with customer_id, recency, T, and cohort columns.
+            Input data with customer_id, recency, T, and cohort columns, plus the
+            dropout covariate columns and an optional ``weight`` column.
         """
         self._validate_data(data)
         self.data = data
+        self._aggregation, obs_dim = self._aggregate(data)
+        aggregated = obs_dim == UNIQUE_DIM
+        unique = self._aggregation.unique
+        obs_cohort_idx = pd.Categorical(unique["cohort"], categories=self.cohorts).codes
 
         coords = {
             "customer_id": self.data["customer_id"],
             "cohort": self.cohorts,
             "dropout_covariate": self.dropout_covariate_cols,
         }
+        if aggregated:
+            coords[UNIQUE_DIM] = np.arange(self._aggregation.n_unique)
+
         with pm.Model(coords=coords) as self.model:
             if self.dropout_covariate_cols:
                 # Customer-level behavior with covariates
                 dropout_data = pm.Data(
                     "dropout_data",
-                    self.data[self.dropout_covariate_cols],
-                    dims=["customer_id", "dropout_covariate"],
+                    unique[self.dropout_covariate_cols].to_numpy(),
+                    dims=(obs_dim, "dropout_covariate"),
                 )
 
                 # Get scale parameters (cohort-level baseline)
@@ -337,25 +382,21 @@ class ShiftedBetaGeoModel(CLVModel):
                     "dropout_coefficient"
                 ].create_variable("dropout_coefficient_beta")
 
-                # Apply covariate effects to get customer-level parameters
+                # Apply covariate effects to get row-level parameters
                 # expressions adapted from BG/NBD covariate extensions on p2 of [3]_:
                 # https://www.brucehardie.com/notes/019/time_invariant_covariates.pdf
-                alpha = pm.Deterministic(
-                    "alpha",
-                    alpha_scale[self.cohort_idx]
-                    * pm.math.exp(
-                        -pm.math.dot(dropout_data, dropout_coefficient_alpha)
-                    ),
-                    dims="customer_id",
+                alpha = alpha_scale[obs_cohort_idx] * pm.math.exp(
+                    -pm.math.dot(dropout_data, dropout_coefficient_alpha)
                 )
-                beta = pm.Deterministic(
-                    "beta",
-                    beta_scale[self.cohort_idx]
-                    * pm.math.exp(-pm.math.dot(dropout_data, dropout_coefficient_beta)),
-                    dims="customer_id",
+                beta = beta_scale[obs_cohort_idx] * pm.math.exp(
+                    -pm.math.dot(dropout_data, dropout_coefficient_beta)
                 )
-
-                dropout = ShiftedBetaGeometric.dist(alpha, beta)
+                if not aggregated:
+                    # One value per customer; predictive methods rebuild these from
+                    # alpha_scale/beta_scale and the coefficients, so aggregated models
+                    # leave them unregistered rather than storing draws x unique rows.
+                    alpha = pm.Deterministic("alpha", alpha, dims="customer_id")
+                    beta = pm.Deterministic("beta", beta, dims="customer_id")
             else:
                 # Cohort-level behavior only, no covariates
                 if "alpha" in self.model_config and "beta" in self.model_config:
@@ -369,22 +410,34 @@ class ShiftedBetaGeoModel(CLVModel):
                     alpha = pm.Deterministic("alpha", phi * kappa, dims="cohort")
                     beta = pm.Deterministic("beta", (1.0 - phi) * kappa, dims="cohort")
 
-                dropout = ShiftedBetaGeometric.dist(
-                    alpha[self.cohort_idx],
-                    beta[self.cohort_idx],
-                )
+                alpha = alpha[obs_cohort_idx]
+                beta = beta[obs_cohort_idx]
 
-            # float64 upper: pymc 6.2.0 cannot derive the logp of a discrete Censored
-            # with integer bounds (pymc-devs/pymc#8386, fixed in pymc 6.3). The cast
-            # also keeps ``dropout`` float64 across pymc versions; do not remove casually.
-            pm.Censored(
-                "dropout",
-                dropout,
-                lower=None,
-                upper=self.data["T"].to_numpy(dtype="float64"),
-                observed=self.data["recency"],
-                dims=("customer_id",),
-            )
+            self._build_likelihood(alpha, beta, obs_dim)
+
+    def _build_likelihood(self, alpha, beta, obs_dim: str) -> None:
+        """Add the (weighted) right-censored sBG likelihood over the rows of ``obs_dim``.
+
+        ``alpha`` and ``beta`` are already indexed per row. Each row is ``recency``
+        observed over ``T`` periods; ``recency == T`` is right-censored. Under
+        aggregation the row weights enter as ``pm.Data("weights")`` so the log-likelihood
+        can be unweighted afterwards (see :meth:`compute_log_likelihood`).
+        """
+        unique = self.aggregation.unique
+        weights = (
+            pm.Data("weights", self.aggregation.weights, dims=obs_dim)
+            if obs_dim == UNIQUE_DIM
+            else None
+        )
+        CensoredShiftedBetaGeometric(
+            "dropout",
+            alpha=alpha,
+            beta=beta,
+            T=unique["T"].to_numpy(),
+            weights=weights,
+            observed=unique["recency"].to_numpy(),
+            dims=obs_dim,
+        )
 
     def _extract_predictive_variables(
         self,
