@@ -11,6 +11,8 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+import itertools
+
 import numpy as np
 import pymc as pm
 import pytensor
@@ -33,6 +35,7 @@ from pymc_marketing.clv.distributions import (
     BetaGeoBetaBinom,
     BetaGeoNBD,
     BetaGeoNBDRV,
+    CensoredShiftedBetaGeometric,
     ModifiedBetaGeoNBD,
     ParetoNBD,
     ShiftedBetaGeometric,
@@ -877,3 +880,115 @@ class TestShiftedBetaGeometric:
         assert np.all(init_point < 1e6)  # Should not be extremely large
 
         assert_support_point_is_expected(model, init_point)
+
+
+class TestCensoredShiftedBetaGeometric:
+    """A1: the weighted, right-censored sBG likelihood used by ``ShiftedBetaGeoModel``."""
+
+    class TestRandomVariable(BaseTestDistributionRandom):
+        pymc_dist = CensoredShiftedBetaGeometric
+        pymc_dist_params = {"alpha": 1.0, "beta": 1.0, "T": 5, "weights": 1.0}
+        expected_rv_op_params = {"alpha": 1.0, "beta": 1.0, "T": 5, "weights": 1.0}
+        tests_to_run = [
+            "check_pymc_params_match_rv_op",
+            "check_rv_size",
+        ]
+
+        @pytest.mark.parametrize("T", [2, 5, 12])
+        def test_random_is_censored_at_T(self, T):
+            draws = self.pymc_dist.dist(alpha=0.7, beta=1.5, T=T, size=2000).eval()
+            assert draws.dtype.kind == "i"
+            assert draws.min() >= 1
+            assert draws.max() == T  # right-censored mass at T
+
+        def test_random_ignores_weights(self):
+            rng_a = np.random.default_rng(1)
+            rng_b = np.random.default_rng(1)
+            a = self.pymc_dist.dist(alpha=0.7, beta=1.5, T=6, weights=1.0, size=500)
+            b = self.pymc_dist.dist(alpha=0.7, beta=1.5, T=6, weights=250.0, size=500)
+            draws_a = pm.draw(a, random_seed=rng_a)
+            draws_b = pm.draw(b, random_seed=rng_b)
+            np.testing.assert_array_equal(draws_a, draws_b)
+
+    @staticmethod
+    def _logp_fns():
+        alpha = pt.dscalar("alpha")
+        beta = pt.dscalar("beta")
+        T = pt.dscalar("T")
+        weights = pt.dscalar("weights")
+        value = pt.dscalar("value")
+
+        censored = pm.Censored.dist(
+            ShiftedBetaGeometric.dist(alpha, beta), lower=None, upper=T
+        )
+        reference = pytensor.function([alpha, beta, T, value], pm.logp(censored, value))
+
+        dist = CensoredShiftedBetaGeometric.dist(alpha, beta, T, weights)
+        new = pytensor.function(
+            [alpha, beta, T, weights, value],
+            pm.logp(dist, value),
+            on_unused_input="ignore",
+        )
+        return reference, new
+
+    def test_logp_matches_pm_censored(self):
+        """Weights of 1 reproduce pm.Censored(ShiftedBetaGeometric, upper=T) exactly."""
+        reference, new = self._logp_fns()
+        for alpha, beta, T in itertools.product(
+            [0.3, 1.0, 2.5], [0.5, 1.0, 4.0], [2, 5, 12]
+        ):
+            for recency in range(1, T + 1):
+                expected = reference(alpha, beta, float(T), float(recency))
+                got = new(alpha, beta, float(T), 1.0, float(recency))
+                np.testing.assert_allclose(got, expected, rtol=1e-12, atol=0)
+
+    def test_logp_censored_value_is_survival_at_T_minus_1(self):
+        """At recency == T the likelihood is P(X >= T) = S(T - 1), the pm.Censored convention."""
+        _, new = self._logp_fns()
+        alpha, beta, T = 0.7, 1.5, 6.0
+        log_sf = betaln(alpha, beta + T - 1) - betaln(alpha, beta)
+        np.testing.assert_allclose(new(alpha, beta, T, 1.0, T), log_sf, rtol=1e-12)
+
+    def test_logp_scales_with_weights(self):
+        _, new = self._logp_fns()
+        for recency in [1.0, 3.0, 6.0]:
+            base = new(0.7, 1.5, 6.0, 1.0, recency)
+            np.testing.assert_allclose(
+                new(0.7, 1.5, 6.0, 37.5, recency), 37.5 * base, rtol=1e-12
+            )
+
+    @pytest.mark.parametrize("value", [0.0, -1.0, 7.0])
+    def test_logp_out_of_support(self, value):
+        _, new = self._logp_fns()
+        assert new(0.7, 1.5, 6.0, 1.0, value) == -np.inf
+
+    @pytest.mark.parametrize("alpha, beta", [(-1.0, 2.0), (0.0, 0.0), (1.0, -1.0)])
+    def test_logp_parameter_checks(self, alpha, beta):
+        _, new = self._logp_fns()
+        with pytest.raises(ParameterValueError):
+            new(alpha, beta, 6.0, 1.0, 2.0)
+
+    def test_logp_broadcasts_over_rows(self):
+        alpha = np.array([0.3, 1.0, 2.5])
+        beta = np.array([0.5, 1.0, 4.0])
+        T = np.array([4, 4, 7])
+        weights = np.array([1.0, 2.0, 3.0])
+        value = np.array([1, 4, 7])
+        dist = CensoredShiftedBetaGeometric.dist(alpha, beta, T, weights)
+        got = pm.logp(dist, value).eval()
+        _, new = self._logp_fns()
+        expected = [
+            new(a, b, float(t), w, float(v))
+            for a, b, t, w, v in zip(alpha, beta, T, weights, value, strict=True)
+        ]
+        np.testing.assert_allclose(got, expected, rtol=1e-12)
+
+    def test_default_weights_are_ones(self):
+        # float64 arrays: a bare 1.5 would become a float32 constant and lose precision
+        dist = CensoredShiftedBetaGeometric.dist(
+            np.float64(0.7), np.float64(1.5), T=np.array([3, 5])
+        )
+        _, new = self._logp_fns()
+        got = pm.logp(dist, np.array([3, 2])).eval()
+        expected = [new(0.7, 1.5, 3.0, 1.0, 3.0), new(0.7, 1.5, 5.0, 1.0, 2.0)]
+        np.testing.assert_allclose(got, expected, rtol=1e-12)

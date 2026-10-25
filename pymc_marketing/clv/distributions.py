@@ -796,3 +796,107 @@ class ShiftedBetaGeometric(Discrete):
         if not rv_size_is_none(size):
             geo_mean = pt.full(size, geo_mean)
         return geo_mean
+
+
+class CensoredShiftedBetaGeometricRV(RandomVariable):
+    name = "censored_sbg"
+    signature = "(),(),(),()->()"
+
+    dtype = "int64"
+    _print_name = (
+        "CensoredShiftedBetaGeometric",
+        "\\operatorname{CensoredShiftedBetaGeometric}",
+    )
+
+    @classmethod
+    def rng_fn(cls, rng, alpha, beta, T, weights, size):
+        # ``weights`` only scale the log-likelihood; a draw is one customer's recency.
+        if size is None:
+            size = np.broadcast_shapes(alpha.shape, beta.shape, T.shape, weights.shape)
+
+        alpha = np.broadcast_to(alpha, size)
+        beta = np.broadcast_to(beta, size)
+        T = np.broadcast_to(T, size)
+
+        p = np.clip(rng.beta(a=alpha, b=beta, size=size), 1e-100, 1)
+        return np.minimum(rng.geometric(p, size=size), T).astype("int64")
+
+
+censored_sbg = CensoredShiftedBetaGeometricRV()
+
+
+class CensoredShiftedBetaGeometric(Discrete):
+    r"""Right-censored, count-weighted Shifted Beta-Geometric distribution.
+
+    This is the likelihood row of :class:`~pymc_marketing.clv.ShiftedBetaGeoModel`.
+    A customer observed for ``T`` periods either churned at period ``t < T`` or was
+    still active at the end of the observation window, which is recorded as
+    ``t = T`` and right-censored:
+
+    .. math::
+        \begin{aligned}
+        \mathbb{P}(T=t \mid \alpha,\beta) &= \frac{B(\alpha+1,\beta+t-1)}{B(\alpha,\beta)},
+            \quad t = 1, \dots, T-1 \\
+        \mathbb{P}(X \geq T \mid \alpha,\beta) &= S(T-1) = \frac{B(\alpha,\beta+T-1)}{B(\alpha,\beta)}
+        \end{aligned}
+
+    which is exactly what ``pm.Censored(ShiftedBetaGeometric, upper=T)`` evaluates.
+    The log-probability of each row is multiplied by ``weights`` so that one row can
+    stand for every customer sharing the same ``(alpha, beta, T, value)``; the
+    posterior is identical to the customer-level model.
+
+    ========  ===============================================
+    Support   :math:`t \in \{1, \dots, T\}`
+    ========  ===============================================
+
+    Parameters
+    ----------
+    alpha : tensor_like of float
+        Shape parameter of the dropout Beta distribution (alpha > 0).
+    beta : tensor_like of float
+        Shape parameter of the dropout Beta distribution (beta > 0).
+    T : tensor_like of int
+        Number of observed periods; values equal to ``T`` are right-censored.
+    weights : tensor_like of float, optional
+        Multiplier of each row's log-probability (default 1). Random draws ignore it.
+
+    References
+    ----------
+    .. [1] Fader, P. S., & Hardie, B. G. (2007). How to project customer retention.
+           Journal of Interactive Marketing, 21(1), 76-90.
+           https://faculty.wharton.upenn.edu/wp-content/uploads/2012/04/Fader_hardie_jim_07.pdf
+    """
+
+    rv_op = censored_sbg
+
+    @classmethod
+    def dist(cls, alpha, beta, T, weights=None, *args, **kwargs):
+        alpha = pt.as_tensor_variable(alpha)
+        beta = pt.as_tensor_variable(beta)
+        T = pt.as_tensor_variable(T)
+        weights = (
+            pt.ones_like(T, dtype="float64")
+            if weights is None
+            else pt.as_tensor_variable(weights, dtype="float64")
+        )
+        return super().dist([alpha, beta, T, weights], *args, **kwargs)
+
+    def logp(value, alpha, beta, T, weights):
+        """Weighted log-probability; Expressions (5) and (6) of Fader & Hardie (2007)."""
+        log_norm = betaln(alpha, beta)
+        log_pmf = betaln(alpha + 1, beta + value - 1) - log_norm
+        log_sf = betaln(alpha, beta + T - 1) - log_norm
+
+        logp = pt.switch(pt.lt(value, T), log_pmf, log_sf)
+        logp = pt.switch(
+            pt.or_(pt.lt(value, 1), pt.gt(value, T)),
+            -np.inf,
+            logp,
+        )
+
+        return check_parameters(
+            weights * logp,
+            alpha > 0,
+            beta > 0,
+            msg="alpha > 0, beta > 0",
+        )
