@@ -41,6 +41,7 @@ from arviz_stats.utils import ELPDData
 
 __all__ = [
     "UNIQUE_DIM",
+    "UNWEIGHTED_ATTR",
     "AggregatedObservations",
     "aggregate_observations",
     "customer_loo",
@@ -54,6 +55,10 @@ UNIQUE_DIM = "unique_obs"
 
 #: ``unique rows / customers`` above which aggregation buys little and a warning is emitted.
 LOW_COMPRESSION_RATIO = 0.5
+
+#: Attribute marking a ``log_likelihood`` group whose values are per-customer, not
+#: ``weights * logp`` as PyMC stores them for an aggregated model.
+UNWEIGHTED_ATTR = "pymc_marketing_unweighted_log_likelihood"
 
 _ROW = "_row"
 _UNIQUE_IDX = "_unique_idx"
@@ -187,13 +192,13 @@ def aggregate_observations(
             f"Columns {keys} contain null values; drop or fill them first."
         )
     if weight_col is not None:
-        min_weight = rows.select(nw.col(weight_col).min()).collect().item()
-        if not (min_weight is not None and np.isfinite(min_weight) and min_weight > 0):
-            raise ValueError(
-                f"Column {weight_col!r} must be finite and strictly positive."
-            )
-        n_null = rows.select(nw.col(weight_col).is_null().sum()).collect().item()
-        if n_null:
+        stats = rows.select(
+            nw.col(weight_col).min().alias("min"),
+            nw.col(weight_col).max().alias("max"),
+            nw.col(weight_col).is_null().sum().alias("nulls"),
+        ).collect()
+        lo, hi, nulls = (stats.item(0, name) for name in ("min", "max", "nulls"))
+        if nulls or lo is None or not (np.isfinite(lo) and np.isfinite(hi) and lo > 0):
             raise ValueError(
                 f"Column {weight_col!r} must be finite and strictly positive."
             )
@@ -347,6 +352,8 @@ def survival_counts_to_sbg_data(
             raise ValueError(
                 f"Cohort {cohort!r}: {alive_col} must be non-increasing over {period_col}."
             )
+        if alive[0] <= 0:
+            raise ValueError(f"Cohort {cohort!r} has no customers at {period_col} 0.")
         churned = -np.diff(
             alive
         )  # churn at period t = alive[t-1] - alive[t], t = 1..T-1

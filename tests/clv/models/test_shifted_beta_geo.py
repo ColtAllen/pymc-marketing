@@ -1437,6 +1437,28 @@ class TestShiftedBetaGeoAggregate:
             == agg.aggregation.n_unique
         )
 
+    def test_loo_recomputes_a_weighted_log_likelihood_group(self, cohort_data):
+        """A log_likelihood group written by PyMC itself holds weights * logp; loo() must not reuse it."""
+        plain, agg = self._pair(cohort_data)
+        mock_posterior(plain, draws=100, chains=2, seed=4, spread=0.05)
+        mock_posterior(agg, draws=100, chains=2, seed=4, spread=0.05)
+        reference = plain.loo()
+
+        pm.compute_log_likelihood(agg.idata, model=agg.model, progressbar=False)
+        assert "log_likelihood" in agg.idata  # weighted, as PyMC stores it
+        got = agg.loo()
+
+        np.testing.assert_allclose(got.elpd, reference.elpd, rtol=1e-8)
+        np.testing.assert_allclose(
+            got.elpd_i.values, reference.elpd_i.values, rtol=1e-8
+        )
+        weights = xr.DataArray(agg.aggregation.weights, dims=UNIQUE_DIM)
+        np.testing.assert_allclose(
+            (agg.idata.log_likelihood["dropout"] * weights).sum(UNIQUE_DIM),
+            plain.idata.log_likelihood["dropout"].sum("customer_id"),
+            rtol=1e-10,
+        )
+
     @pytest.mark.slow
     def test_posterior_agrees_within_mcse(self, cohort_data):
         """A5: independent MCMC fits agree within Monte Carlo error."""

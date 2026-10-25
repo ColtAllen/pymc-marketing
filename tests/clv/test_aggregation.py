@@ -130,7 +130,7 @@ class TestAggregateObservations:
         with pytest.raises(ValueError, match="null"):
             aggregate_observations(bad, KEY_COLS)
 
-    @pytest.mark.parametrize("bad_weight", [0.0, -1.0, np.nan])
+    @pytest.mark.parametrize("bad_weight", [0.0, -1.0, np.nan, np.inf])
     def test_non_positive_weight_rejected(self, customer_data, bad_weight):
         bad = customer_data.assign(weight=1.0)
         bad.loc[5, "weight"] = bad_weight
@@ -272,6 +272,11 @@ class TestSurvivalCountsConverter:
         bad = table.assign(n_alive=[10, 11, 4, 4])
         with pytest.raises(ValueError, match="non-increasing"):
             survival_counts_to_sbg_data(bad)
+
+    def test_empty_cohort_rejected(self):
+        table = pd.DataFrame({"cohort": "x", "period": [0, 1, 2], "n_alive": [0, 0, 0]})
+        with pytest.raises(ValueError, match="no customers"):
+            survival_counts_to_sbg_data(table)
 
     def test_periods_must_be_contiguous_from_zero(self):
         table = pd.DataFrame(
