@@ -46,7 +46,7 @@ from pymc_marketing.clv.rfm import (
     rfm_summary,
     rfm_train_test_split,
 )
-from tests.clv.conftest import collect_sorted
+from tests.conftest import collect_sorted
 
 EPOCH = date(1970, 1, 1)
 
