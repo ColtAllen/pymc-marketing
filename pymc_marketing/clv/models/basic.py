@@ -18,12 +18,16 @@ from collections.abc import Sequence
 from typing import Any
 
 import arviz as az
-import numpy as np
-import pandas as pd
+import narwhals.stable.v2 as nw
 import xarray as xr
+from narwhals.stable.v2.typing import IntoFrame
 from pydantic import ConfigDict, InstanceOf, validate_call
 
-from pymc_marketing.model_builder import DifferentModelError, ModelBuilder
+from pymc_marketing.model_builder import (
+    DifferentModelError,
+    ModelBuilder,
+    _to_pandas,
+)
 from pymc_marketing.model_config import (
     ModelConfig,
     _reject_removed_parameters,
@@ -58,54 +62,95 @@ class CLVModel(ModelBuilder):
         self.model_config = parse_model_config(self.model_config)
 
     @staticmethod
+    def _any_row(data: IntoFrame, **checks: nw.Expr) -> dict[str, Any]:
+        """Evaluate aggregate expressions over ``data`` in a single query.
+
+        A lazy table is scanned once, where it lives, and only the one-row result
+        is collected.
+        """
+        frame = nw.from_native(data).lazy()
+        result = frame.select(*(expr.alias(name) for name, expr in checks.items()))
+        return result.collect().rows(named=True)[0]
+
+    @staticmethod
     def _validate_cols(
-        data: pd.DataFrame,
+        data: IntoFrame,
         required_cols: Sequence[str],
         must_be_unique: Sequence[str] = (),
         must_be_homogenous: Sequence[str] = (),
     ):
-        missing = set(required_cols).difference(data.columns)
+        missing = set(required_cols).difference(
+            nw.from_native(data).collect_schema().names()
+        )
         if missing:
             raise ValueError(
                 "The following required columns are missing from the "
                 f"input data: {sorted(list(missing))}"
             )
 
-        n = data.shape[0]
+        counted = [
+            col
+            for col in required_cols
+            if col in must_be_unique or col in must_be_homogenous
+        ]
+        if not counted:
+            return
+        # Suffixed so no count can shadow a data column.
+        counts = CLVModel._any_row(
+            data,
+            _n_rows=nw.len(),
+            **{f"{col}_n_unique": nw.col(col).n_unique() for col in counted},
+        )
 
-        for col in required_cols:
-            if col in must_be_unique:
-                if data[col].nunique() != n:
-                    raise ValueError(f"Column {col} has duplicate entries")
-            if col in must_be_homogenous:
-                if data[col].nunique() != 1:
-                    raise ValueError(f"Column {col} has non-homogeneous entries")
+        for col in counted:
+            n_unique = counts[f"{col}_n_unique"]
+            if col in must_be_unique and n_unique != counts["_n_rows"]:
+                raise ValueError(f"Column {col} has duplicate entries")
+            if col in must_be_homogenous and n_unique != 1:
+                raise ValueError(f"Column {col} has non-homogeneous entries")
 
-    def _validate_frequency(self, data: pd.DataFrame) -> None:
+    def _validate_frequency(self, data: IntoFrame) -> None:
         """Validate frequency column values shared across BTYD and Gamma-Gamma models."""
-        if (data[Col.FREQUENCY] < 0).any():
+        frequency = nw.col(Col.FREQUENCY)
+        found = self._any_row(
+            data,
+            negative=(frequency < 0).any(),
+            # No modulo: pandas columns with a PyArrow dtype do not implement it.
+            fractional=(frequency != frequency.round()).any(),
+        )
+        if found["negative"]:
             raise ValueError("Column frequency has negative values")
-
-        if not (np.mod(data[Col.FREQUENCY], 1) == 0).all():
+        if found["fractional"]:
             raise ValueError("frequency column must contain only integer values")
 
-    def _validate_rfm_data(self, data: pd.DataFrame) -> None:
+    def _validate_rfm_data(self, data: IntoFrame) -> None:
         """Validate frequency, recency, and T columns shared by BTYD transaction models."""
         self._validate_cols(data, required_cols=[Col.FREQUENCY, Col.RECENCY, Col.T])
         self._validate_frequency(data)
 
-        if (data[Col.RECENCY] < 0).any():
+        frequency, recency, T = (
+            nw.col(Col.FREQUENCY),
+            nw.col(Col.RECENCY),
+            nw.col(Col.T),
+        )
+        found = self._any_row(
+            data,
+            negative_recency=(recency < 0).any(),
+            negative_T=(T < 0).any(),
+            recency_without_purchase=((frequency == 0) & (recency > 0)).any(),
+            recency_after_T=(recency > T).any(),
+            zero_T=(T == 0).any(),
+        )
+        if found["negative_recency"]:
             raise ValueError("Column recency has negative values")
-        if (data[Col.T] < 0).any():
+        if found["negative_T"]:
             raise ValueError("Column T has negative values")
-
-        if ((data[Col.FREQUENCY] == 0) & (data[Col.RECENCY] > 0)).any():
+        if found["recency_without_purchase"]:
             raise ValueError("recency cannot be greater than 0 if frequency is 0")
-
-        if (data[Col.RECENCY] > data[Col.T]).any():
+        if found["recency_after_T"]:
             raise ValueError("recency cannot be greater than T")
 
-        if (data[Col.T] == 0).any():
+        if found["zero_T"]:
             warnings.warn(
                 "T=0 is uninformative for model fitting. This occurs when a customer "
                 "makes a purchase in the final observed time period.",
@@ -113,7 +158,7 @@ class CLVModel(ModelBuilder):
                 stacklevel=2,
             )
 
-    def _validate_data(self, data: pd.DataFrame) -> None:
+    def _validate_data(self, data: IntoFrame) -> None:
         """Validate model input data. Child classes should override and call super()."""
         self._validate_rfm_data(data)
 
@@ -124,7 +169,7 @@ class CLVModel(ModelBuilder):
         else:
             return f"{self._model_type}\n{self.model.str_repr()}"
 
-    def _prepare_fit(self, data: pd.DataFrame | None = None) -> None:
+    def _prepare_fit(self, data: IntoFrame | None = None) -> None:
         """Build the model on first fit, and reject a second fit on different data.
 
         CLV models bake the training data into the model graph, so refitting a built
@@ -137,7 +182,12 @@ class CLVModel(ModelBuilder):
                     "or call `build_model(data)` first."
                 )
             self.build_model(data)  # type: ignore[call-arg]
-        elif data is not None and not self.data.equals(data):  # type: ignore[attr-defined]
+        elif (
+            data is not None
+            and data is not self.data  # type: ignore[attr-defined]
+            # Compared as pandas so the same values in another library still match.
+            and not _to_pandas(self.data).equals(_to_pandas(data))  # type: ignore[attr-defined]
+        ):
             raise ValueError(
                 "The model was built with different data. "
                 "Create a new model instance to fit new data."

@@ -66,7 +66,7 @@ from pydantic import Field, validate_call
 from pymc_extras.prior import Prior
 from sklearn.preprocessing import LabelEncoder
 
-from pymc_marketing.model_builder import RegressionModelBuilder
+from pymc_marketing.model_builder import RegressionModelBuilder, _to_pandas
 from pymc_marketing.model_config import parse_model_config
 
 try:
@@ -288,6 +288,7 @@ class PIEModel(RegressionModelBuilder):
                 "Install it with: pip install 'pymc-marketing[pie]'"
             )
 
+        X = _to_pandas(X)
         feature_cols = self.pre_determined_features + self.post_determined_features
         missing = set(feature_cols) - set(X.columns)
         if missing:
@@ -393,6 +394,7 @@ class PIEModel(RegressionModelBuilder):
         y : pd.Series or np.ndarray, optional
             Target values. When ``None`` (predict mode), dummy zeros are used.
         """
+        X = _to_pandas(X)
         missing = set(self._feature_columns) - set(X.columns)
         if missing:
             raise ValueError(

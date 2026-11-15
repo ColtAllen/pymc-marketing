@@ -1522,3 +1522,24 @@ class TestModelConfigFormattingClassForm:
         result = ModelIO._model_config_formatting(model_config)
 
         assert isinstance(result["x"], LogNormalPrior)
+
+
+def test_to_pandas(to_backend):
+    from pymc_marketing.model_builder import _to_pandas
+
+    df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    result = _to_pandas(to_backend(df))
+    assert isinstance(result, pd.DataFrame)
+    pd.testing.assert_frame_equal(result, df, check_dtype=False)
+
+
+def test_to_pandas_series_and_pass_through():
+    from pymc_marketing.model_builder import _to_pandas
+
+    pl = pytest.importorskip("polars")
+    series = _to_pandas(pl.Series("y", [1.0, 2.0]))
+    pd.testing.assert_series_equal(series, pd.Series([1.0, 2.0], name="y"))
+
+    array = np.arange(3)
+    assert _to_pandas(array) is array
+    assert _to_pandas(None) is None

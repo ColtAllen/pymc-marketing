@@ -342,6 +342,29 @@ def test_bart_response_override(small_corpus, response):
         bad.build_model(X, y)
 
 
+def test_any_dataframe_library_builds_the_pandas_model(
+    to_backend, default_model, small_corpus
+):
+    """Non-pandas X goes through validation, build, fit_data and prediction data."""
+    X, y = small_corpus
+    X_native = to_backend(X)
+
+    X_valid, y_valid = default_model._validate_fit_inputs(X_native, y)
+    default_model.build_model(X_valid, y_valid)
+    fit_data = default_model.create_fit_data(X_valid, y_valid)
+    default_model._data_setter(X_native)
+
+    expected = PIEModel(
+        pre_determined_features=default_model.pre_determined_features,
+        post_determined_features=default_model.post_determined_features,
+    )
+    expected.build_model(X, y)
+    np.testing.assert_array_equal(
+        default_model.model["X"].get_value(), expected.model["X"].get_value()
+    )
+    assert set(fit_data.data_vars) == {*X.columns, default_model.output_var}
+
+
 def test_extra_columns_in_X_are_ignored(small_corpus):
     """Columns outside the pre/post features are dropped, not trained on."""
     X, y = small_corpus

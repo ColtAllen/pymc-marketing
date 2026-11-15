@@ -23,6 +23,7 @@ from inspect import signature
 from typing import Any, Literal, cast
 
 import arviz as az
+import narwhals.stable.v2 as nw
 import numpy as np
 import pandas as pd
 import pymc as pm
@@ -53,6 +54,25 @@ except ImportError:
     def check_array(X, **kwargs):
         """Check if the input data is valid for the model."""
         return X
+
+
+def _to_pandas(data: Any) -> Any:
+    """Return a dataframe or series of any Narwhals-supported library as pandas.
+
+    Lazy frames are collected. Anything Narwhals does not know (arrays, xarray
+    objects, ``None``) is returned unchanged.
+    """
+    if isinstance(data, (pd.DataFrame, pd.Series)):
+        return data
+    frame = nw.from_native(data, pass_through=True, allow_series=True)
+    if isinstance(frame, nw.LazyFrame):
+        frame = frame.collect()
+    # Built from NumPy arrays: ``to_pandas`` needs pyarrow for some libraries.
+    if isinstance(frame, nw.DataFrame):
+        return pd.DataFrame({name: frame[name].to_numpy() for name in frame.columns})
+    if isinstance(frame, nw.Series):
+        return pd.Series(frame.to_numpy(), name=frame.name)
+    return data
 
 
 def create_idata_accessor(value: str, message: str):
@@ -775,10 +795,17 @@ class ModelFitter:
 
         """
         data = getattr(self, "data", None)
-        if data is None:
-            return None
         if isinstance(data, pd.DataFrame):
             return data.to_xarray()
+        frame = nw.from_native(data, pass_through=True)
+        if isinstance(frame, nw.LazyFrame):
+            frame = frame.collect()
+        if isinstance(frame, nw.DataFrame):
+            # Straight from the columns: the table may hold every customer, so it
+            # is not copied into pandas first.
+            return xr.Dataset(
+                {name: ("index", frame[name].to_numpy()) for name in frame.columns}
+            )
         return data
 
     def _get_sampling_model(self) -> pm.Model:
@@ -1521,6 +1548,8 @@ class RegressionModelBuilder(ModelBuilder):
         Subclasses may override this to accept other X/y forms; ``MMM`` does so
         to read a target embedded in ``X``.
         """
+        X, y = _to_pandas(X), _to_pandas(y)
+
         if (
             isinstance(y, pd.Series)
             and isinstance(X, pd.DataFrame)

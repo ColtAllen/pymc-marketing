@@ -343,3 +343,82 @@ class TestCLVModel:
 
         with pytest.raises(ValueError, match=expected_error_msg):
             CLVModel._validate_cols(data=data, required_cols=required)
+
+
+RFM_DATA = pd.DataFrame(
+    {
+        "customer_id": [1, 2, 3],
+        "frequency": [0.0, 2.0, 5.0],
+        "recency": [0.0, 3.0, 9.0],
+        "T": [10.0, 10.0, 10.0],
+    }
+)
+
+
+class TestValidationOnEveryBackend:
+    """Validation runs as Narwhals aggregations, so it must not depend on the library."""
+
+    def test_valid_data_passes(self, to_backend):
+        data = to_backend(RFM_DATA)
+        CLVModelTest()._validate_rfm_data(data)
+        CLVModel._validate_cols(
+            data,
+            required_cols=["customer_id", "T"],
+            must_be_unique=["customer_id"],
+            must_be_homogenous=["T"],
+        )
+
+    @pytest.mark.parametrize(
+        "column, values, match",
+        [
+            ("frequency", [-1.0, 2.0, 5.0], "frequency has negative values"),
+            ("frequency", [0.0, 2.5, 5.0], "only integer values"),
+            ("recency", [0.0, -3.0, 9.0], "recency has negative values"),
+            ("T", [10.0, -1.0, 10.0], "T has negative values"),
+            ("recency", [4.0, 3.0, 9.0], "greater than 0 if frequency is 0"),
+            ("recency", [0.0, 3.0, 11.0], "recency cannot be greater than T"),
+        ],
+    )
+    def test_invalid_rfm_data_raises(self, to_backend, column, values, match):
+        data = to_backend(RFM_DATA.assign(**{column: values}))
+        with pytest.raises(ValueError, match=match):
+            CLVModelTest()._validate_rfm_data(data)
+
+    def test_zero_T_warns(self, to_backend):
+        data = to_backend(RFM_DATA.assign(recency=0.0, T=[0.0, 10.0, 10.0]))
+        with pytest.warns(UserWarning, match="T=0 is uninformative"):
+            CLVModelTest()._validate_rfm_data(data)
+
+    def test_duplicates_and_non_homogeneous_raise(self, to_backend):
+        data = to_backend(RFM_DATA.assign(customer_id=[1, 1, 3], T=[10.0, 10.0, 9.0]))
+        with pytest.raises(ValueError, match="customer_id has duplicate entries"):
+            CLVModel._validate_cols(
+                data, required_cols=["customer_id"], must_be_unique=["customer_id"]
+            )
+        with pytest.raises(ValueError, match="T has non-homogeneous entries"):
+            CLVModel._validate_cols(data, required_cols=["T"], must_be_homogenous=["T"])
+
+    def test_missing_columns_raise(self, to_backend):
+        data = to_backend(RFM_DATA[["customer_id"]])
+        with pytest.raises(ValueError, match=r"missing from the input data: \['T'\]"):
+            CLVModel._validate_cols(data, required_cols=["customer_id", "T"])
+
+
+def test_fit_data_group_matches_pandas_on_every_backend(to_backend):
+    model = CLVModelTest(data=to_backend(RFM_DATA))
+    fit_data = model.create_fit_data_group()
+    xr.testing.assert_equal(
+        fit_data.to_dataframe().reset_index(drop=True).to_xarray(),
+        RFM_DATA.to_xarray(),
+    )
+
+
+def test_refit_with_same_values_from_another_library(mocker):
+    pl = pytest.importorskip("polars")
+    mocker.patch("pymc.sample", mock_sample)
+    data = pd.DataFrame({"y": np.arange(10.0)})
+    model = CLVModelTest(data=data)
+    model.build_model(data)
+    model.fit(data=pl.from_pandas(data), tune=0, chains=2, draws=10)
+    with pytest.raises(ValueError, match="built with different data"):
+        model.fit(data=pl.from_pandas(data + 1), tune=0, chains=2, draws=10)
