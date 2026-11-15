@@ -30,6 +30,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import arviz_stats as az
@@ -38,6 +39,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from arviz_stats.utils import ELPDData
+
+try:  # arviz-stats >= 1.3 has one result class per kind
+    from arviz_stats.utils import ELPDDataLOO
+except ImportError:  # arviz-stats 1.2 takes the kind as an argument
+    ELPDDataLOO = partial(ELPDData, kind="loo")  # type: ignore[assignment,misc]
 
 __all__ = [
     "UNIQUE_DIM",
@@ -429,7 +435,13 @@ def customer_loo(
     n_customers = float(weights.sum())
     elpd = float((weights * rows.elpd_i).sum())
     mean = elpd / n_customers
-    se = float(np.sqrt((weights * (rows.elpd_i - mean) ** 2).sum()))
+    # Sample variance (ddof=1) scaled by n, as arviz-stats >= 1.3 computes it.
+    squares = float((weights * (rows.elpd_i - mean) ** 2).sum())
+    se = (
+        float(np.sqrt(squares * n_customers / (n_customers - 1)))
+        if n_customers > 1
+        else 0.0
+    )
     p_loo = float((weights * (lppd_i - rows.elpd_i)).sum())
     n_data_points = (
         round(n_customers)
@@ -437,8 +449,7 @@ def customer_loo(
         else n_customers
     )
 
-    return ELPDData(
-        kind="loo",
+    return ELPDDataLOO(
         elpd=elpd,
         se=se,
         p=p_loo,
