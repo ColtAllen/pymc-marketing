@@ -1691,6 +1691,32 @@ def test_compute_log_likelihood_refuses_replaced_data(toy_X, toy_y, mock_pymc_sa
         model.compute_log_likelihood(progressbar=False)
 
 
+class ObservedDataBuilderTest(ObservedModelBuilderTest):
+    """Like ObservedModelBuilderTest, but the observed values live in a pm.Data container."""
+
+    def build_model(self, **kwargs):
+        with pm.Model(coords={"obs": range(10)}) as self.model:
+            mu = pm.Normal("mu", 0, 1)
+            y_data = pm.Data("y_data", np.linspace(-1, 1, 10), dims="obs")
+            pm.Normal("y", mu, 1, observed=y_data, dims="obs")
+
+
+def test_compute_log_likelihood_refuses_replaced_observed_data(mock_pymc_sample):
+    model = ObservedDataBuilderTest(
+        sampler_config={"draws": 20, "tune": 20, "chains": 2}
+    )
+    model.fit(random_seed=0)
+    model.compute_log_likelihood(progressbar=False)
+
+    with model.model:
+        pm.set_data({"y_data": np.zeros(10)})
+
+    with pytest.raises(
+        ValueError, match="differs from the data the model was fitted on"
+    ):
+        model.compute_log_likelihood(progressbar=False)
+
+
 def test_refit_drops_stale_log_likelihood(mock_pymc_sample):
     model = ObservedModelBuilderTest(
         sampler_config={"draws": 20, "tune": 20, "chains": 2}

@@ -1490,13 +1490,22 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
 
     def _require_fit_data_in_model(self) -> None:
         """Raise when the model's data containers no longer hold the data it was fitted on."""
-        if self.idata is None or "constant_data" not in self.idata.children:
+        if self.idata is None:
             return
-        fitted = self.idata["constant_data"]
-        for name, shared in self.model.named_vars.items():
-            if name not in fitted.data_vars or not hasattr(shared, "get_value"):
-                continue
-            if not np.array_equal(shared.get_value(), fitted[name].values):
+        current: dict[str, Any] = {}
+        if "constant_data" in self.idata.children:
+            fitted = self.idata["constant_data"]
+            for name, shared in self.model.named_vars.items():
+                if name in fitted.data_vars and hasattr(shared, "get_value"):
+                    current[name] = (shared.get_value(), fitted[name].values)
+        if "observed_data" in self.idata.children:
+            fitted = self.idata["observed_data"]
+            for rv in self.model.observed_RVs:
+                if rv.name in fitted.data_vars:
+                    value = self.model.rvs_to_values[rv].eval()
+                    current[rv.name] = (value, fitted[rv.name].values)
+        for name, (value, fitted_value) in current.items():
+            if not np.array_equal(value, fitted_value, equal_nan=True):
                 raise ValueError(
                     f"The data variable '{name}' in the model differs from the data the model was fitted on, "
                     "most likely because an out-of-sample prediction replaced it. "
