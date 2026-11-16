@@ -1373,6 +1373,108 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         "Call the 'sample_posterior_predictive' method with predictions=True first.",
     )
 
+    def _get_predictive_model(self) -> pm.Model:
+        """Return the model that predictive sampling runs on.
+
+        Override to sample a variant of the fitted model.
+        For example, a copy with new data or with extra predictive-only variables.
+        """
+        return self.model
+
+    @requires_model
+    def sample_prior_predictive(
+        self,
+        samples: int | None = None,
+        *,
+        extend_idata: bool = True,
+        combined: bool = True,
+        **kwargs: Any,
+    ) -> xr.Dataset:
+        """Sample from the model's prior predictive distribution.
+
+        Parameters
+        ----------
+        samples : int, optional
+            Number of prior draws.
+            Defaults to ``sampler_config["draws"]`` when set, otherwise 500.
+        extend_idata : bool
+            Whether to add the ``prior`` and ``prior_predictive`` groups to ``self.idata``.
+            Defaults to True.
+        combined : bool
+            Combine the chain and draw dims into a ``sample`` dim.
+            Defaults to True.
+        **kwargs
+            Passed to :func:`pymc.sample_prior_predictive`.
+
+        Returns
+        -------
+        xr.Dataset
+            The prior predictive samples.
+
+        """
+        if samples is None:
+            samples = self.sampler_config.get("draws", 500)
+
+        with self._get_predictive_model():
+            prior_pred: xr.DataTree = pm.sample_prior_predictive(
+                draws=samples, **kwargs
+            )
+            prior_pred["/prior"].attrs["pymc_marketing_version"] = __version__
+            prior_pred["/prior_predictive"].attrs["pymc_marketing_version"] = (
+                __version__
+            )
+            self.set_idata_attrs(prior_pred)
+
+        if extend_idata:
+            if self.idata is not None:
+                self.idata.update(prior_pred)
+            else:
+                self.idata = prior_pred
+
+        return az.extract(
+            prior_pred, "prior_predictive", combined=combined, keep_dataset=True
+        )
+
+    @requires_model
+    def sample_posterior_predictive(
+        self,
+        *,
+        extend_idata: bool = True,
+        combined: bool = True,
+        **kwargs: Any,
+    ) -> xr.Dataset:
+        """Sample from the model's posterior predictive distribution.
+
+        Parameters
+        ----------
+        extend_idata : bool
+            Whether to add the sampled group to ``self.idata``.
+            Defaults to True.
+        combined : bool
+            Combine the chain and draw dims into a ``sample`` dim.
+            Defaults to True.
+        **kwargs
+            Passed to :func:`pymc.sample_posterior_predictive`.
+            With ``predictions=True`` the samples are stored in, and returned from, the ``predictions`` group.
+
+        Returns
+        -------
+        xr.Dataset
+            The posterior predictive samples.
+
+        """
+        if self.idata is None or "posterior" not in self.idata:
+            raise RuntimeError("The model hasn't been fit yet, call .fit() first")
+
+        with self._get_predictive_model():
+            post_pred = pm.sample_posterior_predictive(self.idata, **kwargs)
+
+        if extend_idata:
+            self.idata.update(post_pred)
+
+        group = "predictions" if kwargs.get("predictions") else "posterior_predictive"
+        return az.extract(post_pred, group, combined=combined, keep_dataset=True)
+
 
 class RegressionModelBuilder(ModelBuilder):
     """ModelBuilder class providing an easy-to-use API similar to scikit-learn for regression models.
@@ -1756,32 +1858,13 @@ class RegressionModelBuilder(ModelBuilder):
         """
         if y is None:
             y = np.zeros(len(X))
-        if samples is None:
-            samples = self.sampler_config.get("draws", 500)
 
         if not hasattr(self, "model"):
             self.build_model(X, y)
 
-        with self.model:  # sample with new input data
-            prior_pred: xr.DataTree = pm.sample_prior_predictive(
-                draws=samples, **kwargs
-            )
-            prior_pred["/prior"].attrs["pymc_marketing_version"] = __version__
-            prior_pred["/prior_predictive"].attrs["pymc_marketing_version"] = (
-                __version__
-            )
-            self.set_idata_attrs(prior_pred)
-
-        if extend_idata:
-            if self.idata is not None:
-                self.idata.update(prior_pred)
-            else:
-                self.idata = prior_pred
-
-        result = az.extract(
-            prior_pred, "prior_predictive", combined=combined, keep_dataset=True
+        return super().sample_prior_predictive(
+            samples, extend_idata=extend_idata, combined=combined, **kwargs
         )
-        return result
 
     def sample_posterior_predictive(
         self,
@@ -1812,24 +1895,11 @@ class RegressionModelBuilder(ModelBuilder):
         """
         self._data_setter(X)
 
-        with self.model:
-            post_pred = pm.sample_posterior_predictive(
-                self.idata, **sample_posterior_predictive_kwargs
-            )
-
-        if extend_idata:
-            self.idata.update(post_pred)  # type: ignore
-
-        variable_name = (
-            "predictions"
-            if sample_posterior_predictive_kwargs.get("predictions")
-            else "posterior_predictive"
+        return super().sample_posterior_predictive(
+            extend_idata=extend_idata,
+            combined=combined,
+            **sample_posterior_predictive_kwargs,
         )
-
-        result = az.extract(
-            post_pred, variable_name, combined=combined, keep_dataset=True
-        )
-        return result
 
     def predict_proba(
         self,

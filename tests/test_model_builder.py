@@ -275,6 +275,29 @@ class ModelBuilderTest(ModelBuilder):
         return self.idata
 
 
+class ObservedModelBuilderTest(ModelBuilderTest):
+    """Non-regression ModelBuilder with an observed variable and the inherited fit."""
+
+    _model_type = "observed_test_model"
+
+    def build_model(self, **kwargs):
+        with pm.Model(coords={"obs": range(10)}) as self.model:
+            mu = pm.Normal("mu", 0, 1)
+            pm.Normal("y", mu, 1, observed=np.linspace(-1, 1, 10), dims="obs")
+
+    # ModelBuilderTest replaces fit; this class needs the shared pipeline back.
+    fit = ModelBuilder.fit
+
+
+@pytest.fixture(scope="module")
+def fitted_observed_model(mock_pymc_sample):
+    model = ObservedModelBuilderTest(
+        sampler_config={"draws": 20, "tune": 20, "chains": 2}
+    )
+    model.fit(random_seed=0)
+    return model
+
+
 @pytest.mark.parametrize(
     "model_class,expected_type,test_config",
     [
@@ -1522,3 +1545,57 @@ class TestModelConfigFormattingClassForm:
         result = ModelIO._model_config_formatting(model_config)
 
         assert isinstance(result["x"], LogNormalPrior)
+
+
+@pytest.mark.parametrize("combined", [True, False])
+def test_base_sample_prior_predictive(combined):
+    model = ObservedModelBuilderTest()
+    model.build_model()
+
+    prior = model.sample_prior_predictive(samples=15, combined=combined, random_seed=0)
+
+    assert prior["y"].shape == ((10, 15) if combined else (1, 15, 10))
+    assert "prior" in model.idata
+    assert "prior_predictive" in model.idata
+
+
+def test_base_sample_prior_predictive_requires_model():
+    with pytest.raises(RuntimeError, match="hasn't been built"):
+        ObservedModelBuilderTest().sample_prior_predictive()
+
+
+@pytest.mark.parametrize("combined", [True, False])
+def test_base_sample_posterior_predictive(fitted_observed_model, combined):
+    posterior = fitted_observed_model.idata.posterior
+    chains, draws = posterior.sizes["chain"], posterior.sizes["draw"]
+
+    result = fitted_observed_model.sample_posterior_predictive(
+        combined=combined, random_seed=0
+    )
+
+    expected = (10, chains * draws) if combined else (chains, draws, 10)
+    assert result["y"].shape == expected
+    assert "posterior_predictive" in fitted_observed_model.idata
+
+
+def test_base_sample_posterior_predictive_requires_fit():
+    model = ObservedModelBuilderTest()
+    model.build_model()
+    with pytest.raises(RuntimeError, match="hasn't been fit"):
+        model.sample_posterior_predictive()
+
+
+def test_base_predictive_sampling_uses_predictive_model(
+    fitted_observed_model, monkeypatch
+):
+    clone = fitted_observed_model.model.copy()
+    with clone:
+        pm.Normal("extra", clone["mu"], 1)
+    monkeypatch.setattr(fitted_observed_model, "_get_predictive_model", lambda: clone)
+
+    result = fitted_observed_model.sample_posterior_predictive(
+        var_names=["extra"], extend_idata=False, random_seed=0
+    )
+
+    assert "extra" in result
+    assert "extra" not in fitted_observed_model.model.named_vars
