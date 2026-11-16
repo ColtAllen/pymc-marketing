@@ -1660,7 +1660,35 @@ def test_compute_log_likelihood_without_extending(fitted_observed_model):
 def test_compute_log_likelihood_supports_loo(fitted_observed_model):
     fitted_observed_model.compute_log_likelihood(progressbar=False)
 
-    az.loo(fitted_observed_model.idata)
+    loo = az.loo(fitted_observed_model.idata)
+
+    assert np.isfinite(loo.elpd)
+
+
+def test_compute_log_likelihood_refuses_replaced_data(toy_X, toy_y, mock_pymc_sample):
+    model = RegressionModelBuilderTest(
+        model_config={
+            "a": {"loc": 0, "scale": 10, "dims": ("numbers",)},
+            "b": {"loc": 0, "scale": 10},
+            "obs_error": 2,
+        },
+        sampler_config={"draws": 20, "tune": 20, "chains": 2},
+    )
+    model.fit(toy_X, toy_y, chains=1, draws=20, tune=20)
+    assert "x" in model.idata["constant_data"].data_vars
+
+    model.compute_log_likelihood(progressbar=False)
+    assert "log_likelihood" in model.idata.children
+
+    rng = np.random.default_rng(1)
+    model.sample_posterior_predictive(
+        pd.DataFrame({"input": rng.uniform(size=len(toy_X)) + 5}), extend_idata=False
+    )
+
+    with pytest.raises(
+        ValueError, match="differs from the data the model was fitted on"
+    ):
+        model.compute_log_likelihood(progressbar=False)
 
 
 def test_refit_drops_stale_log_likelihood(mock_pymc_sample):

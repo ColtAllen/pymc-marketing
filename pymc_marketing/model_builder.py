@@ -1488,6 +1488,21 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         group = "predictions" if kwargs.get("predictions") else "posterior_predictive"
         return az.extract(post_pred, group, combined=combined, keep_dataset=True)
 
+    def _require_fit_data_in_model(self) -> None:
+        """Raise when the model's data containers no longer hold the data it was fitted on."""
+        if self.idata is None or "constant_data" not in self.idata.children:
+            return
+        fitted = self.idata["constant_data"]
+        for name, shared in self.model.named_vars.items():
+            if name not in fitted.data_vars or not hasattr(shared, "get_value"):
+                continue
+            if not np.array_equal(shared.get_value(), fitted[name].values):
+                raise ValueError(
+                    f"The data variable '{name}' in the model differs from the data the model was fitted on, "
+                    "most likely because an out-of-sample prediction replaced it. "
+                    "Compute the log-likelihood before predicting, or rebuild the model from the saved file."
+                )
+
     @requires_model
     def compute_log_likelihood(
         self,
@@ -1501,6 +1516,9 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         The result holds one value per observation per posterior draw.
         It can be large and slow for a model with many observations and a sampled posterior.
         That is why :meth:`fit` does not compute it.
+        It raises if the model's data was replaced by an out-of-sample prediction.
+        ``az.loo`` and ``az.waic`` need a posterior with many draws.
+        They are not meaningful on a single-draw MAP fit.
 
         Parameters
         ----------
@@ -1515,6 +1533,13 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         xr.Dataset
             The pointwise log-likelihood of each observed variable.
 
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fit.
+        ValueError
+            If the model has no observed variables, or its data was replaced by an out-of-sample prediction.
+
         Examples
         --------
         .. code-block:: python
@@ -1528,12 +1553,8 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         """
         if self.idata is None or "posterior" not in self.idata:
             raise RuntimeError("The model hasn't been fit yet, call .fit() first")
-        if not self.model.observed_RVs:
-            # PyMC returns an empty group here rather than raising.
-            raise ValueError(
-                f"{type(self).__name__} has no observed variables, "
-                "so there is no log-likelihood to compute."
-            )
+        self._require_observed(self.model)
+        self._require_fit_data_in_model()
 
         log_likelihood = pm.compute_log_likelihood(
             self.idata,
