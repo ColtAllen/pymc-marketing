@@ -19,6 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import arviz as az
 import graphviz
 import numpy as np
 import pandas as pd
@@ -1615,3 +1616,72 @@ def test_base_predictive_sampling_uses_predictive_model(
 
     assert "extra" in result
     assert "extra" not in fitted_observed_model.model.named_vars
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.parametrize(
+    "method, fit_kwargs",
+    [("mcmc", {}), ("map", {}), ("advi", {"n": 500})],
+)
+def test_compute_log_likelihood(method, fit_kwargs, mock_pymc_sample):
+    model = ObservedModelBuilderTest(
+        sampler_config={"draws": 20, "tune": 20, "chains": 2}
+    )
+    model.fit(method=method, random_seed=0, **fit_kwargs)
+
+    log_likelihood = model.compute_log_likelihood(progressbar=False)
+
+    posterior = model.idata.posterior
+    assert dict(log_likelihood["y"].sizes) == {
+        "chain": posterior.sizes["chain"],
+        "draw": posterior.sizes["draw"],
+        "obs": 10,
+    }
+    xr.testing.assert_identical(
+        model.idata["log_likelihood"].to_dataset(), log_likelihood
+    )
+
+
+def test_compute_log_likelihood_without_extending(fitted_observed_model):
+    if "log_likelihood" in fitted_observed_model.idata.children:
+        fitted_observed_model.idata = fitted_observed_model.idata.drop_nodes(
+            "log_likelihood"
+        )
+
+    log_likelihood = fitted_observed_model.compute_log_likelihood(
+        extend_idata=False, progressbar=False
+    )
+
+    assert "y" in log_likelihood
+    assert "log_likelihood" not in fitted_observed_model.idata.children
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_compute_log_likelihood_supports_loo(fitted_observed_model):
+    fitted_observed_model.compute_log_likelihood(progressbar=False)
+
+    az.loo(fitted_observed_model.idata)
+
+
+def test_refit_drops_stale_log_likelihood(mock_pymc_sample):
+    model = ObservedModelBuilderTest(
+        sampler_config={"draws": 20, "tune": 20, "chains": 2}
+    )
+    model.fit(random_seed=0)
+    model.compute_log_likelihood(progressbar=False)
+
+    model.fit(random_seed=1)
+
+    assert "log_likelihood" not in model.idata.children
+
+
+def test_compute_log_likelihood_requires_fit():
+    model = ObservedModelBuilderTest()
+    model.build_model()
+    with pytest.raises(RuntimeError, match="hasn't been fit"):
+        model.compute_log_likelihood()
+
+
+def test_compute_log_likelihood_requires_observed(fitted_base_model_instance):
+    with pytest.raises(ValueError, match="no observed variables"):
+        fitted_base_model_instance.compute_log_likelihood()

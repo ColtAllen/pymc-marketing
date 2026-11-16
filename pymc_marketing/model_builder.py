@@ -1488,6 +1488,65 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         group = "predictions" if kwargs.get("predictions") else "posterior_predictive"
         return az.extract(post_pred, group, combined=combined, keep_dataset=True)
 
+    @requires_model
+    def compute_log_likelihood(
+        self,
+        *,
+        extend_idata: bool = True,
+        **kwargs: Any,
+    ) -> xr.Dataset:
+        """Compute the pointwise log-likelihood of the observed data.
+
+        Works after any fit method, and after loading a fitted model from file.
+        The result holds one value per observation per posterior draw.
+        It can be large and slow for a model with many observations and a sampled posterior.
+        That is why :meth:`fit` does not compute it.
+
+        Parameters
+        ----------
+        extend_idata : bool
+            Whether to store the result as the ``log_likelihood`` group of ``self.idata``, replacing an existing one.
+            Defaults to True.
+        **kwargs
+            Passed to :func:`pymc.compute_log_likelihood`, for example ``var_names`` or ``progressbar``.
+
+        Returns
+        -------
+        xr.Dataset
+            The pointwise log-likelihood of each observed variable.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            import arviz as az
+
+            model.fit(data)
+            model.compute_log_likelihood()
+            az.loo(model.idata)
+
+        """
+        if self.idata is None or "posterior" not in self.idata:
+            raise RuntimeError("The model hasn't been fit yet, call .fit() first")
+        if not self.model.observed_RVs:
+            # PyMC returns an empty group here rather than raising.
+            raise ValueError(
+                f"{type(self).__name__} has no observed variables, "
+                "so there is no log-likelihood to compute."
+            )
+
+        log_likelihood = pm.compute_log_likelihood(
+            self.idata,
+            model=self.model,
+            extend_inferencedata=False,
+            **kwargs,
+        )
+
+        if extend_idata:
+            self.idata["/log_likelihood"] = log_likelihood
+
+        return log_likelihood
+
 
 class RegressionModelBuilder(ModelBuilder):
     """ModelBuilder class providing an easy-to-use API similar to scikit-learn for regression models.
