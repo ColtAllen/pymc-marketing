@@ -1381,6 +1381,14 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         """
         return self.model
 
+    def _require_observed(self, model: pm.Model) -> None:
+        """Raise when ``model`` has no observed variable to sample or score."""
+        if not model.observed_RVs:
+            raise ValueError(
+                f"{type(self).__name__} has no observed variables. "
+                "Likelihoods added with pm.Potential are not included."
+            )
+
     @requires_model
     def sample_prior_predictive(
         self,
@@ -1415,7 +1423,9 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         if samples is None:
             samples = self.sampler_config.get("draws", 500)
 
-        with self._get_predictive_model():
+        model = self._get_predictive_model()
+        self._require_observed(model)
+        with model:
             prior_pred: xr.DataTree = pm.sample_prior_predictive(
                 draws=samples, **kwargs
             )
@@ -1466,7 +1476,10 @@ class ModelBuilder(ABC, ModelIO, ModelFitter):
         if self.idata is None or "posterior" not in self.idata:
             raise RuntimeError("The model hasn't been fit yet, call .fit() first")
 
-        with self._get_predictive_model():
+        model = self._get_predictive_model()
+        if "var_names" not in kwargs:
+            self._require_observed(model)
+        with model:
             post_pred = pm.sample_posterior_predictive(self.idata, **kwargs)
 
         if extend_idata:

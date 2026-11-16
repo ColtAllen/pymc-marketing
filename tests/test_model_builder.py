@@ -1585,6 +1585,22 @@ def test_base_sample_posterior_predictive_requires_fit():
         model.sample_posterior_predictive()
 
 
+def test_base_sample_prior_predictive_requires_observed():
+    model = ModelBuilderTest()
+    model.build_model()
+    with pytest.raises(ValueError, match="no observed variables"):
+        model.sample_prior_predictive()
+
+
+def test_base_sample_posterior_predictive_requires_observed(
+    fitted_base_model_instance,
+):
+    groups_before = set(fitted_base_model_instance.idata.children)
+    with pytest.raises(ValueError, match="no observed variables"):
+        fitted_base_model_instance.sample_posterior_predictive()
+    assert set(fitted_base_model_instance.idata.children) == groups_before
+
+
 def test_base_predictive_sampling_uses_predictive_model(
     fitted_observed_model, monkeypatch
 ):
