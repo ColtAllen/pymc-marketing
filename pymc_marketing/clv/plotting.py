@@ -16,10 +16,12 @@
 import warnings
 from collections.abc import Sequence
 
+import arviz as az
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pymc as pm
+import xarray as xr
 from arviz_stats.ecdf_utils import (
     compute_ecdf,
     get_pointwise_confidence_band,
@@ -510,7 +512,7 @@ def plot_expected_purchases_ppc(
     ppc : string, optional
         Type of predictive check to perform. Options are 'prior' or 'posterior'; defaults to 'posterior'.
     max_purchases : int, optional
-        Cutoff for bars of purchase counts to plot. Only used when ``plot_type`` is 'hist'. Default is 10.
+        Number of purchase counts to plot, starting at zero. Only used when ``plot_type`` is 'hist'. Default is 10.
     samples : int, optional
         Number of samples to draw for prior predictive checks. This is not used for posterior predictive checks.
     random_seed : int, optional
@@ -538,6 +540,10 @@ def plot_expected_purchases_ppc(
     for integer purchase counts, so its coverage is only approximately the nominal level. It also
     assumes that CDF is known rather than estimated, so it warns when the predictive samples behind
     it are too few relative to the number of customers.
+
+    The error bars of the 'hist' plot are the HDI of the share of customers at each purchase count across draws.
+    The HDI uses ArviZ's default probability.
+    A point-estimate fit shows sampling noise only, because it carries no parameter uncertainty.
     """
     if plot_type not in ("hist", "ecdf"):
         raise ValueError("Specify 'hist' or 'ecdf' for 'plot_type' parameter.")
@@ -586,10 +592,11 @@ def plot_expected_purchases_ppc(
             )
             # n_samples only takes effect for a point-estimate fit, where the posterior holds a
             # single draw; a sampled posterior already provides (chain * draw * customer) samples.
-            # Only the ECDF band needs a precise reference CDF, so only it pays for the extra draws.
+            # The ECDF band needs a precise reference CDF and the histogram needs several draws
+            # to have an interval at all.
             ppc_freq = model.distribution_new_customer_recency_frequency(
                 random_seed=random_seed,
-                n_samples=_REFERENCE_DRAWS if plot_type == "ecdf" else 1,
+                n_samples=_REFERENCE_DRAWS,
             ).sel({Dim.OBS_VAR: Col.FREQUENCY})
             title = "Posterior Predictive Check for Customer Frequency"
             title_prefix = "Posterior Predictive"
@@ -606,18 +613,28 @@ def plot_expected_purchases_ppc(
             **kwargs,
         )
 
-    # convert estimated and observed xarrays into dataframes for plotting
-    estimated = ppc_freq.to_dataframe().value_counts(normalize=True).sort_index()
-    observed = obs_freq.to_dataframe().value_counts(normalize=True).sort_index()
+    # Share of customers at each purchase count, one value per predictive draw. Indexing by the
+    # count itself keeps the two series aligned when a count is missing from either of them, and
+    # the loop keeps a single (draws x customers) boolean array alive at a time.
+    counts = pd.Index(range(max_purchases), name="purchases")
+    shares = xr.concat(
+        [(ppc_freq == count).mean(Dim.CUSTOMER_ID) for count in counts], dim=counts
+    )
+    estimated = shares.mean(("chain", "draw"))
+    interval = az.hdi(shares)
+    observed = xr.concat([(obs_freq == count).mean() for count in counts], dim=counts)
 
-    # PPC histogram plot
+    # pandas takes asymmetric errors as (column, lower/upper, bar). NaN leaves the observed bars
+    # bare. The mean of a skewed share can sit just outside its HDI, hence the clip.
+    yerr = np.full((2, 2, max_purchases), np.nan)
+    yerr[0, 0] = np.clip(estimated - interval.sel(ci_bound="lower"), 0, None)
+    yerr[0, 1] = np.clip(interval.sel(ci_bound="upper") - estimated, 0, None)
+
     ax = pd.DataFrame(
-        {
-            "Estimated": estimated.reset_index()["proportion"].head(max_purchases),
-            "Observed": observed.reset_index()["proportion"].head(max_purchases),
-        },
+        {"Estimated": estimated.to_series(), "Observed": observed.to_series()}
     ).plot(
         kind="bar",
+        yerr=yerr,
         ax=ax,
         title=title,
         xlabel="Repeat Purchases",

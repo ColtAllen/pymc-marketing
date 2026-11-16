@@ -12,12 +12,14 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 import warnings
+from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from matplotlib.container import BarContainer, ErrorbarContainer
 from pytensor.tensor import TensorVariable
 
 from pymc_marketing.clv import (
@@ -257,6 +259,68 @@ def test_plot_expected_purchases_ppc(fitted_model, ppc, max_purchases, samples, 
         assert ax is subplot
 
     # clear any existing pyplot figures
+    plt.close("all")
+
+
+class _FrequencyOnlyModel:
+    """Stand-in exposing only what the 'posterior' histogram path reads."""
+
+    def __init__(self, observed: np.ndarray, predicted: np.ndarray):
+        coords = {"obs_var": ["recency", "frequency"]}
+        self.idata = SimpleNamespace(
+            observed_data={
+                "recency_frequency": xr.DataArray(
+                    np.stack([np.zeros_like(observed), observed], axis=-1),
+                    dims=("customer_id", "obs_var"),
+                    coords=coords,
+                )
+            }
+        )
+        self._predicted = xr.DataArray(
+            np.stack([np.zeros_like(predicted), predicted], axis=-1),
+            dims=("chain", "draw", "customer_id", "obs_var"),
+            coords=coords,
+        )
+
+    def distribution_new_customer_recency_frequency(self, **kwargs):
+        return self._predicted
+
+
+def test_plot_expected_purchases_ppc_hist_aligns_counts_and_draws_hdi():
+    # nobody made exactly 3 repeat purchases, so the observed counts have a gap
+    observed = np.array([0] * 50 + [1] * 30 + [2] * 15 + [4] * 5)
+    predicted = np.random.default_rng(0).poisson(1.0, size=(2, 25, 100))
+    model = _FrequencyOnlyModel(observed, predicted)
+
+    ax = plot_expected_purchases_ppc(model, ppc="posterior", max_purchases=6)
+
+    estimated_bars, observed_bars = (
+        c for c in ax.containers if isinstance(c, BarContainer)
+    )
+    np.testing.assert_allclose(
+        [bar.get_height() for bar in observed_bars],
+        [0.5, 0.3, 0.15, 0.0, 0.05, 0.0],
+    )
+    np.testing.assert_allclose(
+        [bar.get_height() for bar in estimated_bars],
+        [(predicted == k).mean() for k in range(6)],
+    )
+
+    estimated_err, observed_err = (
+        c for c in ax.containers if isinstance(c, ErrorbarContainer)
+    )
+    segments = estimated_err.lines[2][0].get_segments()
+    assert len(segments) == 6
+    for segment, bar in zip(segments, estimated_bars, strict=True):
+        lower, upper = segment[:, 1]
+        assert lower <= bar.get_height() <= upper
+    assert any(segment[1, 1] > segment[0, 1] for segment in segments)
+    # the observed shares are data, not estimates, so they carry no interval
+    assert all(
+        not np.isfinite(segment).any()
+        for segment in observed_err.lines[2][0].get_segments()
+    )
+
     plt.close("all")
 
 
