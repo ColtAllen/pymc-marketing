@@ -70,6 +70,7 @@ EXPECTED = {
         "TIME_SINCE_EXPOSURE": "time since exposure",
         "CV": "cv",
         "SWEEP": "sweep",
+        "BRACKET": "bracket",
     },
     (mmm, "Var"): {
         "CHANNEL_DATA": "channel_data",
@@ -148,6 +149,9 @@ EXPECTED = {
         "M_QUARTILE": "m_quartile",
         "RFM_SCORE": "rfm_score",
         "SEGMENT": "segment",
+        "TEST_FREQUENCY": "test_frequency",
+        "TEST_MONETARY_VALUE": "test_monetary_value",
+        "TEST_T": "test_T",
     },
     (clv, "Dim"): {
         "CUSTOMER_ID": "customer_id",
